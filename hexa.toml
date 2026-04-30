@@ -1,0 +1,9 @@
+[package]
+name = "hive-resource"
+version = "0.1.0"
+description = "Lightweight host-pool resource CLI — SSOT-aware add/remove/list/status for ubu1/ubu2/hetzner inventory. HOME-relative cross-host portable. Depends only on hexa interpreter (no node)."
+entry = "bin/hive-resource"
+license = "MIT"
+
+[package.dependencies]
+hexa = ">=1.0.0"

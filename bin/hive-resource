@@ -1,0 +1,117 @@
+#!/bin/sh
+# bin/hive-resource — lightweight host-pool resource CLI (raw 246 hx-install entry).
+#
+# Purpose: cross-host (Mac orchestrator + ubu1 + ubu2 + hetzner — any user)
+# `.resource` SSOT operator. Wraps tool/resource_op.hexa with self-located
+# package-root resolution so the same shim works for ANY user under raw 41 +
+# raw 163 cross-host config-parity mandate.
+#
+# Lighter than `hive` (full TUI / hexa-native CLI requires hive-hexa-bin
+# build artifact) — only depends on hexa interpreter (`~/.hx/bin/hexa`).
+#
+# Subcommands (passthrough to tool/resource_op.hexa):
+#   list                          show pool with reachable + load + mem
+#   status [host]                 detailed health (ssh + nexus + claude + slots)
+#   add <host>                    probe + bootstrap disclosure (raw 91 C3)
+#   remove <host>                 disclosure (manual .resource edit required)
+#   fix <host>                    nexus shim auto-repair + claude bin probe
+#   oauth-status <host>           per-slot OAuth health
+#   oauth-reset <host>            slot-pool reset disclosure
+#   --selftest                    canonical-form self-check
+#
+# Resolution rules (self-locating via $0, raw 100 canonical-path-discipline):
+#   1) $HIVE_RESOURCE_ROOT env var, if set (package-specific override)
+#   2) self-located package root via $0 — POSIX-portable symlink walk;
+#      after `hx install need-singularity/hive-resource` this resolves to
+#      $HOME/.hx/packages/hive-resource for any user, independent of $HOME
+#      path layout.
+#
+# Exit codes pass through from wrapped tool. raw 12 silent-error-ban: usage
+# errors emit raw 66 ai-native trailer.
+#
+# raw 200 / raw 82 alignment: HEXA_RESOLVER_NO_REROUTE=1 +
+# HEXA_SHIM_NO_DARWIN_LANDING=1 set so the wrapped .hexa runs at the
+# bare Mac inode (not docker container) — required for ssh-probe + chflags
+# + .resource SSOT semantics.
+
+set -eu
+
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "help" ]; then
+  cat <<'USAGE'
+usage: hive-resource <subcmd> [args]
+
+subcommands:
+  list                          show host pool (reachable + load + mem + nexus)
+  status [host]                 detailed health (ssh + nexus + claude + slots)
+  add <host>                    probe + bootstrap (raw 91 C3 disclosure)
+  remove <host>                 disclosure (.resource is git-tracked SSOT)
+  fix <host>                    nexus shim auto-repair + claude bin probe
+  oauth-status <host>           per-slot OAuth health on remote host
+  oauth-reset <host>            slot-pool reset disclosure
+  --selftest                    canonical-form self-check (no host I/O)
+
+env:
+  HIVE_RESOURCE_ROOT            override package root (default: self-located via $0)
+  HEXA                          override hexa interpreter (default: $HOME/.hx/bin/hexa)
+USAGE
+  exit 0
+fi
+
+# ─── Self-locate package root via $0 (POSIX-portable symlink walk) ─────
+# This works for ANY user installing via `hx install need-singularity/hive-resource`
+# regardless of $HOME path layout. The hx install creates
+# ~/.hx/bin/hive-resource symlink → ~/.hx/packages/hive-resource/bin/hive-resource.
+# Walking the symlink resolves to the real package root.
+_self_locate() {
+  _src="$0"
+  while [ -L "$_src" ]; do
+    _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+    _link="$(readlink "$_src")"
+    case "$_link" in
+      /*) _src="$_link" ;;
+      *)  _src="$_dir/$_link" ;;
+    esac
+  done
+  _bin_dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  # Package root = bin/'s parent directory.
+  cd "$_bin_dir/.." && pwd
+}
+
+# Resolve package root: explicit override OR self-located via $0.
+if [ -n "${HIVE_RESOURCE_ROOT:-}" ]; then
+  pkg_root="$HIVE_RESOURCE_ROOT"
+else
+  pkg_root="$(_self_locate)"
+fi
+
+# Resolve hexa interpreter.
+if [ -n "${HEXA:-}" ]; then
+  hexa_bin="$HEXA"
+elif [ -x "$HOME/.hx/bin/hexa" ]; then
+  hexa_bin="$HOME/.hx/bin/hexa"
+elif command -v hexa >/dev/null 2>&1; then
+  hexa_bin="$(command -v hexa)"
+else
+  echo "hive-resource: hexa interpreter not found" >&2
+  echo "reason=hive-resource-hexa-missing fix=hx install hexa   # or set HEXA=/path/to/hexa" >&2
+  exit 2
+fi
+
+tool_path="$pkg_root/tool/resource_op.hexa"
+if [ ! -f "$tool_path" ]; then
+  echo "hive-resource: tool missing at $tool_path" >&2
+  echo "reason=hive-resource-tool-missing fix=hx install need-singularity/hive-resource   # or set HIVE_RESOURCE_ROOT=/path/to/pkg" >&2
+  exit 2
+fi
+
+# Pass HIVE_RESOURCE_ROOT into the wrapped tool so _hive_root() in
+# resource_op.hexa picks up the canonical pkg root deterministically.
+export HIVE_RESOURCE_ROOT="$pkg_root"
+
+# raw 200 + raw 82 dual-flag exempt — ensure the wrapped tool runs at bare
+# Mac inode (not docker container or hexa-resolver remote dispatch).
+exec env \
+  HEXA_RESOLVER_NO_REROUTE=1 \
+  HEXA_SHIM_NO_DARWIN_LANDING=1 \
+  HIVE_RESOURCE_ROOT="$pkg_root" \
+  "$hexa_bin" run "$tool_path" "$@"

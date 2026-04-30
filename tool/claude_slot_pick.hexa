@@ -1,0 +1,1246 @@
+// tool/claude_slot_pick.hexa — claude code multi-slot pool helper
+//
+// @tool(slug="claude_slot_pick", desc="discover ~/.claude-claude<N> slots; track cooldown via .kick_limit_until + last_used via .kick_last_used; pick LRU-available slot or emit slots-list JSON; phantom-guarded against blank-N expansion")
+// @usage:
+//   hexa tool/claude_slot_pick.hexa --list [--json] [--include-phantom] [--refresh]
+//   hexa tool/claude_slot_pick.hexa --pick [--policy lru|rr] [--exclude <csv>]
+//   hexa tool/claude_slot_pick.hexa --mark-cooldown <slot> --kind <session|weekly> --until-epoch <unix> [--source stream_json_signal|live_probe|cache]
+//   hexa tool/claude_slot_pick.hexa --touch <slot>
+//   hexa tool/claude_slot_pick.hexa --probe-all          // ISSUE 2 (2026-04-27): proactive slot pool sweep — iterate all slots, validate oauthAccount + cooldown freshness, stamp probe_source=live_probe so --pick LRU has fresh state for every slot (not just rotated ones).
+//   hexa tool/claude_slot_pick.hexa --invalidate-cache   // F-SLOT-PICKER-LIVE-PROBE (2026-04-28): wipe /tmp/claude_slot_health/*.cache. Run after `claude /login` so the gate re-probes immediately instead of waiting 30s.
+// @exit_codes(0=ok, 1=usage/io, 76=all-slots-exhausted-hard-fail|all-slots-unhealthy-live-probe)
+//
+// raw 11 + raw 66 + raw 80; closes feedback_hive_phantom_slot_pitfall.
+//
+// ── PHANTOM GUARD (decision 1) ────────────────────────────────────────
+// claude CLI auto-mkdirs the directory pointed to by CLAUDE_CONFIG_DIR.
+// If a caller sets CLAUDE_CONFIG_DIR=$HOME/.claude-claude$n with $n
+// expanded to whitespace ("1 2 3 4"), the CLI silently creates
+// "~/.claude-claude1 2 3 4" → phantom slot. This helper:
+//   1. Discovers via literal glob `ls -1d ~/.claude-claude*` — dirs MUST
+//      already exist on disk; no shell-side $n expansion.
+//   2. Validates the suffix is digits-only; suffix containing whitespace
+//      or non-digits → status=phantom, default-hidden from --list.
+//   3. NEVER constructs CLAUDE_CONFIG_DIR with an unset variable. The
+//      --pick output is the literal config_dir of an existing slot, or
+//      hard-fail (exit 76) if the pool is empty/all-cooled.
+//
+// ── COOLDOWN CACHE (decision 2) ────────────────────────────────────────
+// Per-slot cooldown is co-located with the slot itself:
+//   ~/.claude-claude<N>/.kick_limit_until   — JSON
+//     {
+//       "session": {"limit_until":"<iso>"|null, "captured_at":"<iso>"|null},
+//       "weekly":  {"limit_until":"<iso>"|null, "captured_at":"<iso>"|null},
+//       "probe_source": "stream_json_signal"|"live_probe"|"cache"|null,
+//       "last_probe": "<iso>"|null
+//     }
+//   ~/.claude-claude<N>/.kick_last_used     — single ISO line
+//
+// Co-locating with the slot avoids polluting the nexus repo and
+// naturally garbage-collects with the slot dir.
+//
+// ── PICK POLICY (decision 3) ──────────────────────────────────────────
+// Default = LRU.  Reasoning: the operator may add/remove slots over
+// time; round-robin needs a per-pool cursor (one more state file to
+// keep coherent). LRU reads `.kick_last_used` per slot — if the file
+// is missing the slot is treated as "never used" → highest priority.
+// Filter ordering on --pick:
+//   1. drop phantom slots (status=phantom)
+//   2. drop slots with session.limit_until in the future
+//   3. drop slots with weekly.limit_until in the future
+//   4. drop slots in --exclude csv
+//   5. sort by last_used asc (missing/empty first), tie-break by slot id asc
+// `--policy rr` is accepted but currently routes to lru (no cursor file
+// in MVP); the flag is reserved for a future explicit cursor.
+//
+// ── PROBE SOURCE (decision 4) ──────────────────────────────────────────
+// The JSON `probe_source` field tells the consumer how each slot's
+// session/weekly fields were obtained:
+//   "cache"             — read directly from .kick_limit_until
+//   "stream_json_signal"— a prior kick_dispatch run captured a
+//                         rate_limit_event from claude's stream-json
+//                         and wrote the cooldown via --mark-cooldown
+//   "live_probe"        — reserved (future helper extension; this MVP
+//                         does NOT spawn claude itself)
+//   "live_api_probe"    — F-SLOT-PICKER-LIVE-PROBE (2026-04-28): set when
+//                         an actual `claude -p ping` round-trip succeeds
+//                         against the slot's CLAUDE_CONFIG_DIR.  Distinct
+//                         from "live_probe" (static oauthAccount file
+//                         check) so consumers can tell "actually
+//                         round-tripped to Anthropic in last 30s" from
+//                         "only confirmed file on disk".
+//   null                — no probe data; ALL session/weekly subfields
+//                         remain null. NEVER infer remaining-pct from
+//                         absence (raw 73 honesty triad).
+//
+// LIVE-API HEALTH GATE (F-SLOT-PICKER-LIVE-PROBE, 2026-04-28):
+//   Background: 11/12 OAuth refreshTokens silently revoked Anthropic-
+//   side. --pick still returned them as "available" because the gate
+//   only looked at file existence + cooldown windows. Caller saw 401 at
+//   dispatch time and kick FAILed ~91% of the time in B.1.
+//
+//   Algorithm:
+//     1. _pick_lru produces a ranked candidate list (LRU-first).
+//     2. For each candidate, call _live_api_probe(slot):
+//          a. cache hit (TTL 30s, /tmp/claude_slot_health/<N>.cache):
+//             return cached verdict
+//          b. cache miss: spawn
+//                CLAUDE_CONFIG_DIR=<dir> claude -p "ping" \
+//                  --model claude-haiku-4-5
+//             with a 5-sec hard timeout.
+//               exit 0 + non-empty stdout      → healthy
+//               exit non-zero | empty | t/o    → unhealthy
+//             Cache verdict, return.
+//     3. First healthy candidate → emit + exit 0.
+//     4. All candidates unhealthy → raw 66 trailer + exit 76.
+//
+//   Cache invalidation:
+//     * Implicit: 30s TTL via mtime check.
+//     * Explicit: `--invalidate-cache` flag wipes /tmp/claude_slot_health/.
+//
+//   Opt-out (raw 91 honest fallback for tests / regress):
+//     CLAUDE_SLOT_PICK_LIVE_PROBE=0    legacy file-only gate
+//     CLAUDE_SLOT_PICK_PROBE_CMD=...   override probe cmd (selftest mock)
+//     CLAUDE_SLOT_PICK_PROBE_TIMEOUT=N override 5s timeout (default 5)
+//
+// Sentinel format (raw 80):
+//   __SLOT_PICK_RESULT__ <PASS|FAIL> slot=<N|none> reason=<slug>
+//   reason=lru-available             — first-try LRU pick succeeded
+//   reason=self-healed-after-probe   — FIX 1: initial pick empty, inline
+//                                     probe-all refreshed stale 'unknown'
+//                                     slots, retry succeeded
+//   reason=all-slots-exhausted       — even after self-heal probe, no slot
+//                                     is available (genuine pool exhaustion)
+// Err trailer (raw 66):
+//   reason=<slug> fix=<directive>
+//
+// raw-173-non-determinism-rationale-exempt — raw 91 honest C3:
+//   The `date` invocations flagged by the determinism-priority lint
+//   fall into two bounded-effect categories — neither violates raw
+//   173's design-time deterministic-default mandate:
+//     (a) ambient-time boundary (lines 131, 135) — `_now_iso_utc` /
+//         `_now_unix` are the cooldown-comparison + audit-ts boundary;
+//         cooldown semantics inherently require a real-world clock to
+//         decide if a captured limit_until window has expired. Mocking
+//         the clock would invert the contract (the slot pool's purpose
+//         IS to reflect Anthropic-side cooldown reality).
+//     (b) deterministic conversions (lines 152, 155, 180) — `date -u
+//         -r/-d @<epoch>` and `date -u -d <iso>` are PURE functions:
+//         epoch→ISO and ISO→epoch take a parameter and produce a
+//         parameter-determined output; no ambient-time read. The
+//         lint's substring-match heuristic cannot distinguish these
+//         from ambient-clock calls (limitation already acknowledged in
+//         determinism_priority_lint.hexa header lines 47-49 — Tier-B
+//         follow-up: scope-tagged invocation analysis).
+//   The pick policy itself (LRU + tie-break by zero-padded slot id) is
+//   a pure function of the slot array's last_used field; cooldown
+//   filter is a pure function of (limit_until, now). Non-determinism
+//   is contained to (a)+(b) above by design.
+
+struct Slot {
+    slot: str,
+    config_dir: str,
+    is_phantom: bool,
+    session_until: str,
+    session_captured_at: str,
+    weekly_until: str,
+    weekly_captured_at: str,
+    probe_source: str,
+    last_probe: str,
+    last_used: str,
+}
+
+fn _now_iso_utc() -> str {
+    return utc_iso_now()
+}
+
+fn _now_unix() -> i64 {
+    return time_now()
+}
+
+// 2026-04-29 raw 100 P305 + raw 172 fix: cross-platform epoch→ISO conversion.
+// BUG: original used `date -u -r <epoch>` which is BSD/Mac syntax only;
+// fails silently on Linux (hetzner-kick) → returns empty → limit_until=null
+// → cooldown marker has no effective expiry → kick re-tries same slot
+// → infinite-loop-like rotation (raw 173 deterministic-priority violation).
+// FIX: try Mac syntax first, fall back to GNU/Linux syntax. Both run as
+// 2>/dev/null so the failing variant produces empty stdout (caller picks
+// the winner via `len > 0` check).
+fn _epoch_to_iso(epoch: i64) -> str {
+    if epoch <= 0 { return "" }
+    // Mac/BSD: date -u -r <epoch>
+    let mac_out = exec("date -u -r " + to_string(epoch) + " +%Y-%m-%dT%H:%M:%SZ 2>/dev/null").trim()
+    if mac_out.len() > 0 { return mac_out }
+    // GNU/Linux: date -u -d @<epoch>
+    return exec("date -u -d @" + to_string(epoch) + " +%Y-%m-%dT%H:%M:%SZ 2>/dev/null").trim()
+}
+
+fn _iso_to_epoch(iso: str) -> i64 {
+    if iso.len() == 0 { return 0 }
+    // Cross-platform parsing — tries 3 strategies in order:
+    //   1. awk mktime — POSIX-2024 universal (busybox + gawk + macOS awk)
+    //   2. BSD date -j (macOS native)
+    //   3. GNU date -d (Linux coreutils)
+    // Root-cause fix 2026-04-27: docker mac_safe_landing container lacked
+    // BSD date -j → _iso_to_epoch returned 0 → cooldown semantics silently
+    // broke (Sub-J finding). awk mktime works in every shell we route to.
+    let q = _shell_quote(iso)
+    let mut v: i64 = 0
+    if iso.len() >= 19 {
+        let awk_args = iso.substring(0,4) + " " + iso.substring(5,7) + " " + iso.substring(8,10) + " " + iso.substring(11,13) + " " + iso.substring(14,16) + " " + iso.substring(17,19)
+        let awk_cmd = "TZ=UTC awk 'BEGIN{print mktime(\"" + awk_args + "\")}' </dev/null 2>/dev/null"
+        let r1 = exec(awk_cmd).trim()
+        try { v = to_int(r1) } catch e { v = 0 }
+        if v > 0 { return v }
+    }
+    let bsd_cmd = "TZ=UTC date -j -u -f '%Y-%m-%dT%H:%M:%SZ' " + q + " +%s 2>/dev/null"
+    let r2 = exec(bsd_cmd).trim()
+    try { v = to_int(r2) } catch e { v = 0 }
+    if v > 0 { return v }
+    let gnu_cmd = "TZ=UTC date -u -d " + q + " +%s 2>/dev/null"
+    let r3 = exec(gnu_cmd).trim()
+    try { v = to_int(r3) } catch e { v = 0 }
+    return v
+}
+
+fn _file_exists(path: str) -> bool {
+    let r = exec("test -f '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _dir_exists(path: str) -> bool {
+    let r = exec("test -d '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _is_digits(s: str) -> bool {
+    if s.len() == 0 { return false }
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c < "0" || c > "9" { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _json_str(s: str) -> str {
+    let mut out = "\""
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn _json_str_or_null(s: str) -> str {
+    if s.len() == 0 { return "null" }
+    return _json_str(s)
+}
+
+fn _read_text(path: str) -> str {
+    if !_file_exists(path) { return "" }
+    return read_file(path)
+}
+
+// ─── ATOMIC WRITE (FIX 3, 2026-04-27) ─────────────────────────────────
+// Host-side process and docker-mac_safe_landing container can both write
+// the same .kick_limit_until / .kick_last_used file via bind-mount. A
+// direct overwrite (write_file) leaves a partial-content window where the
+// probe race can read truncated/empty JSON → status=unknown collapse.
+// Mitigation: write to <path>.tmp.<pid>, then `mv -f` rename. POSIX rename
+// is atomic on the same filesystem, so readers always see the prior full
+// version or the new full version, never a half-written file.
+fn _atomic_write(path: str, content: str) -> bool {
+    let pid = exec("echo $$").trim()
+    let tmp = path + ".tmp." + pid
+    write_file(tmp, content)
+    let r = exec("mv -f " + _shell_quote(tmp) + " " + _shell_quote(path) + " 2>&1; echo __RC__$?").trim()
+    let idx = r.index_of("__RC__")
+    if idx < 0 { return false }
+    let rc = r.substring(idx + 6, r.len()).trim()
+    if rc != "0" {
+        // best-effort cleanup of orphaned tmp file
+        let _ = exec("rm -f " + _shell_quote(tmp) + " 2>/dev/null")
+        return false
+    }
+    return true
+}
+
+// Best-effort JSON field extractor for flat string values written by
+// THIS helper. Format is tightly controlled (no nested arrays / escapes
+// beyond the standard set), so a substring scan is sufficient.
+fn _flat_json_field(text: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = text.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    // @triad: atomize
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 } else { break }
+    }
+    if j >= text.len() { return "" }
+    let first = text.substring(j, j + 1)
+    if first == "n" {
+        // null
+        if j + 4 <= text.len() && text.substring(j, j + 4) == "null" { return "" }
+    }
+    if first != "\"" {
+        // primitive — not used for our schema, return empty
+        return ""
+    }
+    let mut k = j + 1
+    let mut esc = false
+    // @triad: atomize
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { break }
+        k = k + 1
+    }
+    return text.substring(j + 1, k)
+}
+
+// ─── NULL-COOLDOWN SANITIZATION (FIX 4, 2026-04-27) ───────────────────
+// Defense in depth against null-value misclassification of cooldown state.
+//
+// Root-cause shape: when probe-all writes .kick_limit_until with no active
+// limit, both session.limit_until and weekly.limit_until are JSON `null`.
+// `_flat_json_field` correctly returns "" for null today, but the parent-
+// agent diagnostic captured a transient repro where 12 slots were
+// misclassified as cooldown=12 with this exact file shape. Possible causes:
+//   1. Race between writer and reader producing partial JSON (mitigated by
+//      FIX 3 atomic_write but not airtight across bind-mount filesystems).
+//   2. Mixed-version file shapes if any other writer ever produced
+//      `"limit_until": "null"` (string) instead of `null` (literal).
+//   3. Future regression of `_flat_json_field` null-handling branch.
+//
+// Mitigation: at the read boundary in `_discover_slots`, normalize any
+// extracted limit_until value that is NOT a plausible ISO-8601 timestamp
+// to "". A plausible timestamp must have len >= 19 and parse via
+// `_iso_to_epoch` to a non-zero epoch. Anything else (literal "null",
+// whitespace, "0", garbage) becomes "" → status=available.
+//
+// The sanitizer also emits __SLOT_SANITIZE__ on stderr when it activates,
+// so any future recurrence of the bug is visible in launchd logs.
+fn _is_plausible_iso(s: str) -> bool {
+    let t = s.trim()
+    if t.len() < 19 { return false }
+    if t == "null" || t == "NULL" || t == "Null" { return false }
+    let e = _iso_to_epoch(t)
+    if e <= 0 { return false }
+    return true
+}
+
+fn _sanitize_limit_until(raw: str, slot_id: str, kind: str) -> str {
+    if raw.len() == 0 { return "" }
+    if _is_plausible_iso(raw) { return raw }
+    // Anomaly: extracted a non-empty value that doesn't parse as ISO.
+    // Emit a one-line diagnostic so the recurrence is visible, then coerce
+    // to "" so downstream cooldown logic treats slot as available (correct
+    // behavior — null/garbage means "no cooldown set").
+    eprintln("__SLOT_SANITIZE__ slot=" + slot_id + " kind=" + kind + " raw=" + _json_str(raw) + " action=coerce-to-empty")
+    return ""
+}
+
+// Slice a top-level object value: `"key": { ... }` returns the inner
+// `{ ... }` substring, depth-aware.
+fn _flat_json_object(text: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = text.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    // @triad: atomize
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 } else { break }
+    }
+    if j >= text.len() { return "" }
+    if text.substring(j, j + 1) != "{" { return "" }
+    let mut depth: i64 = 0
+    let mut k = j
+    let mut in_str = false
+    let mut esc = false
+    // @triad: atomize
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { in_str = !in_str; k = k + 1; continue }
+        if !in_str {
+            if c == "{" { depth = depth + 1 }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 { return text.substring(j, k + 1) }
+            }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// ─── Slot discovery ────────────────────────────────────────────────────
+fn _slot_prefix() -> str {
+    // CLAUDE_SLOT_TEST_HOME — opt-in test override. When set, slots are
+    // discovered under <override>/.claude-claude<N> instead of $HOME/...
+    // Production callers never set this; falsifier harness uses it to test
+    // with a clean tempdir without breaking hexa-lang's own $HOME usage.
+    let test_home = env("CLAUDE_SLOT_TEST_HOME")
+    if test_home.len() > 0 { return test_home + "/.claude-claude" }
+    return env("HOME") + "/.claude-claude"
+}
+
+fn _discover_slots() -> [Slot] {
+    let prefix = _slot_prefix()
+    // Literal glob — dirs must exist already (phantom guard 1).
+    let raw = exec("ls -1d " + prefix + "* 2>/dev/null").trim()
+    let mut out: [Slot] = []
+    if raw.len() == 0 { return out }
+    let parts = raw.split("\n")
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(parts) {
+        let dir = parts[i].trim()
+        if dir.len() == 0 { i = i + 1; continue }
+        if !dir.starts_with(prefix) { i = i + 1; continue }
+        if !_dir_exists(dir) { i = i + 1; continue }
+        let suffix = dir.substring(prefix.len(), dir.len())
+        let phantom = !_is_digits(suffix)
+        // Read sidecar metadata (if any).
+        let limit_path = dir + "/.kick_limit_until"
+        let used_path = dir + "/.kick_last_used"
+        let mut sess_until = ""
+        let mut sess_at = ""
+        let mut wk_until = ""
+        let mut wk_at = ""
+        let mut probe_src = ""
+        let mut last_probe = ""
+        if _file_exists(limit_path) {
+            let body = _read_text(limit_path)
+            let sess_obj = _flat_json_object(body, "session")
+            if sess_obj.len() > 0 {
+                sess_until = _flat_json_field(sess_obj, "limit_until")
+                sess_at = _flat_json_field(sess_obj, "captured_at")
+            }
+            let wk_obj = _flat_json_object(body, "weekly")
+            if wk_obj.len() > 0 {
+                wk_until = _flat_json_field(wk_obj, "limit_until")
+                wk_at = _flat_json_field(wk_obj, "captured_at")
+            }
+            probe_src = _flat_json_field(body, "probe_source")
+            last_probe = _flat_json_field(body, "last_probe")
+            // FIX 4 (2026-04-27): null-cooldown sanitization. Coerce any
+            // extracted limit_until that isn't a plausible ISO timestamp to
+            // empty so _slot_status / _probe_one_slot can never misclassify
+            // a null/garbage value as an active cooldown window.
+            sess_until = _sanitize_limit_until(sess_until, suffix, "session")
+            wk_until = _sanitize_limit_until(wk_until, suffix, "weekly")
+        }
+        let mut last_used = ""
+        if _file_exists(used_path) {
+            last_used = _read_text(used_path).trim()
+        }
+        out = out + [Slot {
+            slot: suffix,
+            config_dir: dir,
+            is_phantom: phantom,
+            session_until: sess_until,
+            session_captured_at: sess_at,
+            weekly_until: wk_until,
+            weekly_captured_at: wk_at,
+            probe_source: probe_src,
+            last_probe: last_probe,
+            last_used: last_used,
+        }]
+        i = i + 1
+    }
+    return out
+}
+
+fn _slot_status(s: Slot) -> str {
+    if s.is_phantom { return "phantom" }
+    let now_e = _now_unix()
+    if s.session_until.len() > 0 {
+        let e = _iso_to_epoch(s.session_until)
+        if e > now_e { return "session_limit" }
+    }
+    if s.weekly_until.len() > 0 {
+        let e = _iso_to_epoch(s.weekly_until)
+        if e > now_e { return "weekly_limit" }
+    }
+    if s.probe_source.len() == 0 && s.last_used.len() == 0 { return "unknown" }
+    return "available"
+}
+
+// ─── --list / --json ───────────────────────────────────────────────────
+fn _emit_slots_json(slots: [Slot], include_phantom: bool) -> str {
+    let mut buf = "{\n"
+    buf = buf + "  \"schema_version\": \"1\",\n"
+    buf = buf + "  \"generated_at\": " + _json_str(_now_iso_utc()) + ",\n"
+    buf = buf + "  \"slots\": [\n"
+    let mut total: i64 = 0
+    let mut n_avail: i64 = 0
+    let mut n_sess: i64 = 0
+    let mut n_wk: i64 = 0
+    let mut n_unk: i64 = 0
+    let mut n_phan: i64 = 0
+    let mut first = true
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(slots) {
+        let s = slots[i]
+        let status = _slot_status(s)
+        if status == "phantom" { n_phan = n_phan + 1 }
+        else if status == "session_limit" { n_sess = n_sess + 1 }
+        else if status == "weekly_limit" { n_wk = n_wk + 1 }
+        else if status == "unknown" { n_unk = n_unk + 1 }
+        else { n_avail = n_avail + 1 }
+        if status == "phantom" && !include_phantom { i = i + 1; continue }
+        total = total + 1
+        if !first { buf = buf + ",\n" }
+        first = false
+        buf = buf + "    {\n"
+        buf = buf + "      \"slot\": " + _json_str(s.slot) + ",\n"
+        buf = buf + "      \"config_dir\": " + _json_str(s.config_dir) + ",\n"
+        buf = buf + "      \"status\": " + _json_str(status) + ",\n"
+        // session block — null subfields when no probe data
+        buf = buf + "      \"session\": {\n"
+        buf = buf + "        \"limit_until\": " + _json_str_or_null(s.session_until) + ",\n"
+        buf = buf + "        \"remaining_5h_window_pct\": null\n"
+        buf = buf + "      },\n"
+        buf = buf + "      \"weekly\": {\n"
+        buf = buf + "        \"limit_until\": " + _json_str_or_null(s.weekly_until) + ",\n"
+        buf = buf + "        \"remaining_pct\": null,\n"
+        buf = buf + "        \"renews_in_days\": null\n"
+        buf = buf + "      },\n"
+        buf = buf + "      \"last_used\": " + _json_str_or_null(s.last_used) + ",\n"
+        buf = buf + "      \"last_probe\": " + _json_str_or_null(s.last_probe) + ",\n"
+        buf = buf + "      \"probe_source\": " + _json_str_or_null(s.probe_source) + "\n"
+        buf = buf + "    }"
+        i = i + 1
+    }
+    buf = buf + "\n  ],\n"
+    buf = buf + "  \"summary\": {\n"
+    buf = buf + "    \"total\": " + to_string(total) + ",\n"
+    buf = buf + "    \"available\": " + to_string(n_avail) + ",\n"
+    buf = buf + "    \"session_limit\": " + to_string(n_sess) + ",\n"
+    buf = buf + "    \"weekly_limit\": " + to_string(n_wk) + ",\n"
+    buf = buf + "    \"unknown\": " + to_string(n_unk) + ",\n"
+    buf = buf + "    \"phantom\": " + to_string(n_phan) + "\n"
+    buf = buf + "  }\n"
+    buf = buf + "}\n"
+    return buf
+}
+
+fn _emit_slots_table(slots: [Slot], include_phantom: bool) -> str {
+    let mut buf = ""
+    buf = buf + "slot config_dir status session_until weekly_until last_used probe_source\n"
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(slots) {
+        let s = slots[i]
+        let status = _slot_status(s)
+        if status == "phantom" && !include_phantom { i = i + 1; continue }
+        let su = if s.session_until.len() > 0 { s.session_until } else { "-" }
+        let wu = if s.weekly_until.len() > 0 { s.weekly_until } else { "-" }
+        let lu = if s.last_used.len() > 0 { s.last_used } else { "-" }
+        let ps = if s.probe_source.len() > 0 { s.probe_source } else { "-" }
+        buf = buf + s.slot + " " + s.config_dir + " " + status + " " + su + " " + wu + " " + lu + " " + ps + "\n"
+        i = i + 1
+    }
+    return buf
+}
+
+// ─── --pick (LRU among available) ─────────────────────────────────────
+fn _csv_contains(csv: str, key: str) -> bool {
+    if csv.len() == 0 { return false }
+    let parts = csv.split(",")
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(parts) {
+        if parts[i].trim() == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _pick_lru(slots: [Slot], exclude_csv: str) -> i64 {
+    // Returns index of picked slot in `slots`, or -1 if none available.
+    let mut best: i64 = -1
+    let mut best_key = ""
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(slots) {
+        let s = slots[i]
+        let status = _slot_status(s)
+        if status != "available" && status != "unknown" { i = i + 1; continue }
+        if _csv_contains(exclude_csv, s.slot) { i = i + 1; continue }
+        // Sort key: empty last_used → "" sorts before any ISO; tie-break by slot id (zero-padded).
+        let lu = s.last_used
+        // Pad slot id to 6 digits for stable compare.
+        let mut padded = s.slot
+        // @triad: atomize (REVIEW-NEEDED)
+        while padded.len() < 6 { padded = "0" + padded }
+        let key = lu + "|" + padded
+        if best < 0 || key < best_key {
+            best = i
+            best_key = key
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ─── --mark-cooldown / --touch (writers) ──────────────────────────────
+fn _write_cooldown(slot_id: str, kind: str, until_iso: str, source: str) -> bool {
+    let dir = _slot_prefix() + slot_id
+    if !_dir_exists(dir) {
+        eprintln("reason=slot-dir-missing fix=ls -1d " + _slot_prefix() + "*   # available slots")
+        return false
+    }
+    let path = dir + "/.kick_limit_until"
+    let now = _now_iso_utc()
+    let body = _read_text(path)
+    let mut sess_until = ""
+    let mut sess_at = ""
+    let mut wk_until = ""
+    let mut wk_at = ""
+    if body.len() > 0 {
+        let so = _flat_json_object(body, "session")
+        if so.len() > 0 {
+            sess_until = _flat_json_field(so, "limit_until")
+            sess_at = _flat_json_field(so, "captured_at")
+        }
+        let wo = _flat_json_object(body, "weekly")
+        if wo.len() > 0 {
+            wk_until = _flat_json_field(wo, "limit_until")
+            wk_at = _flat_json_field(wo, "captured_at")
+        }
+    }
+    if kind == "session" {
+        sess_until = until_iso
+        sess_at = now
+    } else {
+        if kind == "weekly" {
+            wk_until = until_iso
+            wk_at = now
+        } else {
+            eprintln("reason=invalid-kind-" + kind + " fix=use --kind session|weekly")
+            return false
+        }
+    }
+    let mut buf = "{\n"
+    buf = buf + "  \"session\": {\n"
+    buf = buf + "    \"limit_until\": " + _json_str_or_null(sess_until) + ",\n"
+    buf = buf + "    \"captured_at\": " + _json_str_or_null(sess_at) + "\n"
+    buf = buf + "  },\n"
+    buf = buf + "  \"weekly\": {\n"
+    buf = buf + "    \"limit_until\": " + _json_str_or_null(wk_until) + ",\n"
+    buf = buf + "    \"captured_at\": " + _json_str_or_null(wk_at) + "\n"
+    buf = buf + "  },\n"
+    buf = buf + "  \"probe_source\": " + _json_str(source) + ",\n"
+    buf = buf + "  \"last_probe\": " + _json_str(now) + "\n"
+    buf = buf + "}\n"
+    if !_atomic_write(path, buf) {
+        eprintln("reason=atomic-write-failed fix=check filesystem space + perms on " + path)
+        return false
+    }
+    return true
+}
+
+fn _touch_slot(slot_id: str) -> bool {
+    let dir = _slot_prefix() + slot_id
+    if !_dir_exists(dir) {
+        eprintln("reason=slot-dir-missing fix=ls -1d " + _slot_prefix() + "*")
+        return false
+    }
+    let path = dir + "/.kick_last_used"
+    if !_atomic_write(path, _now_iso_utc() + "\n") {
+        eprintln("reason=atomic-write-failed fix=check filesystem space + perms on " + path)
+        return false
+    }
+    return true
+}
+
+// ─── --probe-all (ISSUE 2, 2026-04-27) ────────────────────────────────
+// Iterate every discovered slot and run a *dry-check* probe:
+//   1) oauthAccount.emailAddress present in <slot>/.claude.json
+//   2) .kick_limit_until either absent OR all limit_until timestamps in past
+//   3) write/refresh .kick_limit_until with probe_source="live_probe" + last_probe=<now>
+//      (preserves any future-dated cooldown windows; only refreshes provenance fields)
+// Why dry-check vs real /v1/messages curl: full curl per slot every 5min would
+// (a) consume billable quota on healthy slots and (b) require oauth token
+// refresh dance which the CLI does internally — we only need to confirm config
+// is intact so --pick will not pick a half-installed slot. Stale cooldown
+// windows (already expired) are *harmless* — pick already ignores them — but
+// the probe writes the freshly-stamped probe_source so list/pick logic can
+// distinguish "never touched" (status=unknown) from "actively healthy".
+//
+// Sentinel (raw 80):
+//   __SLOT_PROBE_ALL__ <PASS|FAIL> probed=<N> available=<N> cooldown=<N> error=<N>
+// Where:
+//   probed    — total non-phantom slot dirs probed
+//   available — slots with valid oauthAccount + no future cooldown
+//   cooldown  — slots with valid oauth but session/weekly limit_until > now
+//   error     — slots with missing/invalid .claude.json oauthAccount
+fn _probe_one_slot(s: Slot) -> str {
+    // Returns one of: "available" | "cooldown" | "error"
+    if s.is_phantom { return "error" }
+    let cfg = s.config_dir + "/.claude.json"
+    if !_file_exists(cfg) { return "error" }
+    let body = _read_text(cfg)
+    if body.len() == 0 { return "error" }
+    // Find oauthAccount object — flat scan for "emailAddress" presence within
+    // an oauthAccount block. Cheap substring test (no nested JSON parser).
+    let oa_idx = body.index_of("\"oauthAccount\"")
+    if oa_idx < 0 { return "error" }
+    let tail = body.substring(oa_idx, body.len())
+    let em_idx = tail.index_of("\"emailAddress\"")
+    if em_idx < 0 { return "error" }
+    // emailAddress must be a non-null non-empty string within ~200 chars of the field.
+    let em_tail = tail.substring(em_idx, tail.len())
+    let colon_idx = em_tail.index_of(":")
+    if colon_idx < 0 { return "error" }
+    // skip whitespace + opening quote
+    let mut k = colon_idx + 1
+    // @triad: atomize
+    while k < em_tail.len() {
+        let c = em_tail.substring(k, k + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { k = k + 1 } else { break }
+    }
+    if k >= em_tail.len() { return "error" }
+    let first = em_tail.substring(k, k + 1)
+    if first == "n" { return "error" }   // null
+    if first != "\"" { return "error" }
+    // ensure at least one char before closing quote (non-empty email)
+    let mut q = k + 1
+    let mut esc = false
+    let mut email_len: i64 = 0
+    // @triad: atomize
+    while q < em_tail.len() {
+        let c = em_tail.substring(q, q + 1)
+        if esc { esc = false; q = q + 1; email_len = email_len + 1; continue }
+        if c == "\\" { esc = true; q = q + 1; continue }
+        if c == "\"" { break }
+        email_len = email_len + 1
+        q = q + 1
+    }
+    if email_len == 0 { return "error" }
+    // oauthAccount valid; now check cooldown freshness.
+    let now_e = _now_unix()
+    let mut in_cooldown = false
+    if s.session_until.len() > 0 {
+        let e = _iso_to_epoch(s.session_until)
+        if e > now_e { in_cooldown = true }
+    }
+    if s.weekly_until.len() > 0 {
+        let e = _iso_to_epoch(s.weekly_until)
+        if e > now_e { in_cooldown = true }
+    }
+    if in_cooldown { return "cooldown" }
+    return "available"
+}
+
+fn _stamp_probe_source(s: Slot, source: str) -> bool {
+    // Refresh .kick_limit_until with probe_source + last_probe, preserving
+    // existing session/weekly limit_until windows. Idempotent.
+    let path = s.config_dir + "/.kick_limit_until"
+    let now = _now_iso_utc()
+    let mut sess_until = s.session_until
+    let mut sess_at = s.session_captured_at
+    let mut wk_until = s.weekly_until
+    let mut wk_at = s.weekly_captured_at
+    let mut buf = "{\n"
+    buf = buf + "  \"session\": {\n"
+    buf = buf + "    \"limit_until\": " + _json_str_or_null(sess_until) + ",\n"
+    buf = buf + "    \"captured_at\": " + _json_str_or_null(sess_at) + "\n"
+    buf = buf + "  },\n"
+    buf = buf + "  \"weekly\": {\n"
+    buf = buf + "    \"limit_until\": " + _json_str_or_null(wk_until) + ",\n"
+    buf = buf + "    \"captured_at\": " + _json_str_or_null(wk_at) + "\n"
+    buf = buf + "  },\n"
+    buf = buf + "  \"probe_source\": " + _json_str(source) + ",\n"
+    buf = buf + "  \"last_probe\": " + _json_str(now) + "\n"
+    buf = buf + "}\n"
+    if !_atomic_write(path, buf) {
+        eprintln("reason=atomic-write-failed fix=check filesystem space + perms on " + path)
+        return false
+    }
+    return true
+}
+
+// ─── LIVE-API HEALTH PROBE (F-SLOT-PICKER-LIVE-PROBE, 2026-04-28) ────
+// Round-trip an actual `claude -p ping` to Anthropic for a single slot
+// and cache the verdict at /tmp/claude_slot_health/<slot>.cache for 30s.
+// See top-of-file LIVE-API HEALTH GATE block for full motivation.
+//
+// Cache file format (single line, atomic write):
+//   <verdict>\t<epoch_seconds>\t<reason_slug>
+// Where verdict ∈ {"healthy","unhealthy"}.
+//
+// On unhealthy: reason_slug carries one of:
+//   "auth-401"        — exit non-zero AND stderr/stdout matched 401 pattern
+//   "exit-nonzero"    — exit non-zero with no obvious 401 signature
+//   "empty-stdout"    — exit 0 but stdout empty (defensive, very rare)
+//   "timeout"         — wall-clock > timeout_s
+//   "probe-disabled"  — CLAUDE_SLOT_PICK_LIVE_PROBE=0 → never unhealthy via
+//                       this path; gate skips probe and returns "healthy"
+//                       (legacy fallback).  Recorded for transparency.
+fn _health_cache_dir() -> str {
+    return "/tmp/claude_slot_health"
+}
+
+fn _ensure_health_cache_dir() -> bool {
+    let d = _health_cache_dir()
+    let r = exec("mkdir -p " + _shell_quote(d) + " 2>&1; echo __RC__$?").trim()
+    let idx = r.index_of("__RC__")
+    if idx < 0 { return false }
+    return r.substring(idx + 6, r.len()).trim() == "0"
+}
+
+fn _health_cache_path(slot_id: str) -> str {
+    return _health_cache_dir() + "/" + slot_id + ".cache"
+}
+
+fn _health_cache_ttl_seconds() -> i64 {
+    // F-SPLP-3 falsifier window: 30s.  Tunable via env for test harness;
+    // production callers must NOT override (cache stale-pick risk grows).
+    let ov = env("CLAUDE_SLOT_PICK_CACHE_TTL")
+    if ov.len() > 0 {
+        let mut v: i64 = 0
+        try { v = to_int(ov) } catch e { v = 0 }
+        if v > 0 { return v }
+    }
+    return 30
+}
+
+fn _health_probe_timeout_seconds() -> i64 {
+    let ov = env("CLAUDE_SLOT_PICK_PROBE_TIMEOUT")
+    if ov.len() > 0 {
+        let mut v: i64 = 0
+        try { v = to_int(ov) } catch e { v = 0 }
+        if v > 0 { return v }
+    }
+    return 5
+}
+
+fn _health_cache_read(slot_id: str) -> str {
+    // Returns the cached line as "<verdict>\t<epoch>\t<reason>" if fresh,
+    // or "" if missing / expired / unreadable.
+    let p = _health_cache_path(slot_id)
+    if !_file_exists(p) { return "" }
+    let body = _read_text(p).trim()
+    if body.len() == 0 { return "" }
+    // Parse epoch field (col 2, tab-delimited).
+    let parts = body.split("\t")
+    if len(parts) < 2 { return "" }
+    let mut written: i64 = 0
+    try { written = to_int(parts[1]) } catch e { written = 0 }
+    if written <= 0 { return "" }
+    let now_e = _now_unix()
+    let age = now_e - written
+    let ttl = _health_cache_ttl_seconds()
+    if age > ttl || age < 0 { return "" }
+    return body
+}
+
+fn _health_cache_write(slot_id: str, verdict: str, reason: str) -> bool {
+    if !_ensure_health_cache_dir() { return false }
+    let p = _health_cache_path(slot_id)
+    let line = verdict + "\t" + to_string(_now_unix()) + "\t" + reason + "\n"
+    return _atomic_write(p, line)
+}
+
+fn _health_invalidate_cache() -> i64 {
+    let d = _health_cache_dir()
+    if !_dir_exists(d) { return 0 }
+    let r = exec("rm -f " + _shell_quote(d) + "/*.cache 2>&1; echo __RC__$?").trim()
+    let idx = r.index_of("__RC__")
+    if idx < 0 { return 1 }
+    let rc = r.substring(idx + 6, r.len()).trim()
+    if rc != "0" { return 1 }
+    return 0
+}
+
+fn _probe_cmd_template() -> str {
+    // Override hook for selftest harness — the test injects a mock script
+    // that returns 401 / exits 0 deterministically.  Production default
+    // is the real claude CLI ping.  The string MUST contain the literal
+    // substring "{CONFIG_DIR}" which is replaced per slot.
+    let ov = env("CLAUDE_SLOT_PICK_PROBE_CMD")
+    if ov.len() > 0 { return ov }
+    // Default: real `claude -p ping` against haiku-4-5.  We add 2>&1 so the
+    // 401 string can be matched off combined output regardless of which
+    // stream the CLI writes to.  --output-format text keeps stdout simple.
+    return "CLAUDE_CONFIG_DIR={CONFIG_DIR} claude -p ping --model claude-haiku-4-5 --output-format text 2>&1"
+}
+
+fn _classify_unhealthy_reason(combined: str, exit_rc: i64, timed_out: bool) -> str {
+    if timed_out { return "timeout" }
+    if exit_rc == 0 {
+        // exit 0 only reaches this path if stdout was empty.
+        return "empty-stdout"
+    }
+    // Heuristic 401 detection — matches both `claude -p` HTTP-relay surface
+    // and direct curl /v1/messages 401 bodies.  Substring scan is sufficient.
+    if combined.index_of("401") >= 0 { return "auth-401" }
+    if combined.index_of("authentication_error") >= 0 { return "auth-401" }
+    if combined.index_of("invalid_api_key") >= 0 { return "auth-401" }
+    if combined.index_of("Invalid authentication credentials") >= 0 { return "auth-401" }
+    if combined.index_of("Please run /login") >= 0 { return "auth-401" }
+    return "exit-nonzero"
+}
+
+fn _live_api_probe(s: Slot) -> str {
+    // Returns "healthy" or "unhealthy".  Side-effect: writes cache file.
+    let disabled = env("CLAUDE_SLOT_PICK_LIVE_PROBE")
+    if disabled == "0" {
+        // Legacy bypass — record as healthy with reason=probe-disabled.
+        let _ = _health_cache_write(s.slot, "healthy", "probe-disabled")
+        return "healthy"
+    }
+    // Cache lookup first.
+    let cached = _health_cache_read(s.slot)
+    if cached.len() > 0 {
+        let parts = cached.split("\t")
+        if len(parts) >= 1 {
+            let verdict = parts[0]
+            if verdict == "healthy" || verdict == "unhealthy" {
+                eprintln("__SLOT_LIVE_PROBE__ slot=" + s.slot + " verdict=" + verdict + " source=cache")
+                return verdict
+            }
+        }
+        // malformed cache → fall through to fresh probe
+    }
+    // Fresh probe.  Wrap the user-supplied template in `timeout` for the
+    // hard wall-clock cutoff.  GNU coreutils `timeout` is on linux + macOS
+    // (via brew); on macOS without coreutils we fall back to BSD-only
+    // workaround via `gtimeout` if present, else a perl alarm.
+    let tmpl = _probe_cmd_template()
+    let cd = _shell_quote(s.config_dir)
+    // Replace {CONFIG_DIR} placeholder.  Manual replace because we need
+    // shell-quoted form to defend against pathological dirs.
+    let mut cmd = tmpl
+    let ph = "{CONFIG_DIR}"
+    let ph_idx = cmd.index_of(ph)
+    if ph_idx >= 0 {
+        cmd = cmd.substring(0, ph_idx) + cd + cmd.substring(ph_idx + ph.len(), cmd.len())
+    }
+    let to_s = _health_probe_timeout_seconds()
+    // Prefer GNU timeout (coreutils); else gtimeout (homebrew); else perl alarm.
+    // We always emit __RC__<n> sentinel so we can distinguish 124 (timeout) from
+    // 0 (success) from other non-zero (auth fail, etc.) regardless of which
+    // wrapper actually fired.
+    let timeout_probe = exec("command -v timeout 2>/dev/null; command -v gtimeout 2>/dev/null").trim()
+    let mut wrapped = ""
+    if timeout_probe.index_of("/timeout") >= 0 {
+        wrapped = "timeout " + to_string(to_s) + " sh -c " + _shell_quote(cmd) + "; echo __RC__$?"
+    } else if timeout_probe.index_of("/gtimeout") >= 0 {
+        wrapped = "gtimeout " + to_string(to_s) + " sh -c " + _shell_quote(cmd) + "; echo __RC__$?"
+    } else {
+        // perl SIGALRM fallback — exit 124 on alarm to match coreutils convention
+        let perl_wrap = "perl -e 'alarm(" + to_string(to_s) + "); exec(@ARGV) or exit 127' sh -c " + _shell_quote(cmd) + "; rc=$?; if [ $rc -eq 142 ]; then rc=124; fi; echo __RC__$rc"
+        wrapped = perl_wrap
+    }
+    let started = _now_unix()
+    let raw = exec(wrapped)
+    let elapsed = _now_unix() - started
+    let idx = raw.index_of("__RC__")
+    let mut combined = raw
+    let mut rc: i64 = 1
+    if idx >= 0 {
+        combined = raw.substring(0, idx)
+        let rcs = raw.substring(idx + 6, raw.len()).trim()
+        try { rc = to_int(rcs) } catch e { rc = 1 }
+    }
+    let timed_out = (rc == 124)
+    let stdout_trim = combined.trim()
+    let mut verdict = "unhealthy"
+    let mut reason = ""
+    if rc == 0 && stdout_trim.len() > 0 {
+        verdict = "healthy"
+        reason = "ok"
+    } else {
+        verdict = "unhealthy"
+        reason = _classify_unhealthy_reason(combined, rc, timed_out)
+    }
+    let _ = _health_cache_write(s.slot, verdict, reason)
+    eprintln("__SLOT_LIVE_PROBE__ slot=" + s.slot + " verdict=" + verdict + " reason=" + reason + " elapsed_s=" + to_string(elapsed) + " source=fresh")
+    return verdict
+}
+
+// _pick_lru_with_live_gate iterates _pick_lru's ordering, applying the
+// live-API gate on each candidate.  Returns picked Slot or {slot:""}
+// sentinel on full exhaustion.
+fn _pick_with_live_gate(slots: [Slot], exclude_csv: str) -> i64 {
+    // We re-implement the loop instead of calling _pick_lru repeatedly +
+    // exclude growing list because exclude_csv is consumer-supplied; we
+    // don't want to mutate it.  Build a local "tried" set instead.
+    let mut tried = ""
+    let mut probed: i64 = 0
+    let n = len(slots)
+    // @triad: atomize
+    while probed < n {
+        // build effective exclude = caller exclude_csv ∪ tried
+        let mut eff = exclude_csv
+        if tried.len() > 0 {
+            if eff.len() > 0 { eff = eff + "," + tried } else { eff = tried }
+        }
+        let idx = _pick_lru(slots, eff)
+        if idx < 0 { return -1 }
+        let cand = slots[idx]
+        let v = _live_api_probe(cand)
+        if v == "healthy" {
+            return idx
+        }
+        // unhealthy → add to tried set, try next
+        if tried.len() == 0 { tried = cand.slot } else { tried = tried + "," + cand.slot }
+        probed = probed + 1
+    }
+    return -1
+}
+
+fn _probe_all_slots() -> i64 {
+    // Returns 0 on PASS, 1 on FAIL (any error class > 0 still yields PASS unless
+    // ALL slots fail; a FAIL exit means the pool is structurally broken).
+    let slots = _discover_slots()
+    let mut probed: i64 = 0
+    let mut n_avail: i64 = 0
+    let mut n_cool:  i64 = 0
+    let mut n_err:   i64 = 0
+    let mut i: i64 = 0
+    // @triad: atomize
+    while i < len(slots) {
+        let s = slots[i]
+        if s.is_phantom { i = i + 1; continue }
+        probed = probed + 1
+        let outcome = _probe_one_slot(s)
+        if outcome == "available" {
+            n_avail = n_avail + 1
+            let _ = _stamp_probe_source(s, "live_probe")
+        } else if outcome == "cooldown" {
+            n_cool = n_cool + 1
+            let _ = _stamp_probe_source(s, "live_probe")
+        } else {
+            n_err = n_err + 1
+        }
+        i = i + 1
+    }
+    let verdict = if probed > 0 && n_err < probed { "PASS" } else { "FAIL" }
+    eprintln("__SLOT_PROBE_ALL__ " + verdict + " probed=" + to_string(probed) + " available=" + to_string(n_avail) + " cooldown=" + to_string(n_cool) + " error=" + to_string(n_err))
+    if verdict == "FAIL" {
+        eprintln("reason=slot-pool-empty-or-all-error fix=ls -1d $HOME/.claude-claude*   # check slot dirs exist + .claude.json present in each (run /login in claude CLI to repair)")
+        return 1
+    }
+    return 0
+}
+
+fn _usage() -> void {
+    eprintln("usage:")
+    eprintln("  hexa tool/claude_slot_pick.hexa --list [--json] [--include-phantom] [--refresh]")
+    eprintln("  hexa tool/claude_slot_pick.hexa --pick [--policy lru|rr] [--exclude <csv>]")
+    eprintln("  hexa tool/claude_slot_pick.hexa --mark-cooldown <slot> --kind <session|weekly> --until-epoch <unix> [--source stream_json_signal|live_probe|cache]")
+    eprintln("  hexa tool/claude_slot_pick.hexa --touch <slot>")
+    eprintln("  hexa tool/claude_slot_pick.hexa --probe-all                # ISSUE 2: proactive sweep, intended for launchd 5min cadence")
+    eprintln("  hexa tool/claude_slot_pick.hexa --invalidate-cache         # F-SLOT-PICKER-LIVE-PROBE: wipe /tmp/claude_slot_health/*.cache (use after /login refresh)")
+    eprintln("sentinel (raw 80): __SLOT_PICK_RESULT__ <PASS|FAIL> slot=<N|none> reason=<slug>")
+    eprintln("                   __SLOT_PROBE_ALL__ <PASS|FAIL> probed=<N> available=<N> cooldown=<N> error=<N>")
+    eprintln("                   __SLOT_LIVE_PROBE__ slot=<N> verdict=<healthy|unhealthy> reason=<slug> source=<cache|fresh>")
+    eprintln("err     (raw 66): reason=<slug> fix=<directive>")
+}
+
+fn main() -> void {
+    let raw = args()
+    let mut start = 2
+    if raw.len() >= 3 && raw[1] == "run" { start = 3 }
+    let mut mode = ""
+    let mut json_out = false
+    let mut include_phantom = false
+    let mut refresh = false
+    let mut policy = "lru"
+    let mut exclude_csv = ""
+    let mut mark_slot = ""
+    let mut mark_kind = ""
+    let mut mark_until_epoch: i64 = 0
+    let mut mark_source = "stream_json_signal"
+    let mut touch_slot = ""
+    let mut i = start
+    // @triad: atomize
+    while i < raw.len() {
+        let a = raw[i]
+        if a == "--list" { mode = "list"; i = i + 1; continue }
+        if a == "--pick" { mode = "pick"; i = i + 1; continue }
+        if a == "--probe-all" { mode = "probe-all"; i = i + 1; continue }
+        if a == "--invalidate-cache" { mode = "invalidate-cache"; i = i + 1; continue }
+        if a == "--mark-cooldown" {
+            mode = "mark"
+            if i + 1 < raw.len() { mark_slot = raw[i + 1] }
+            i = i + 2
+            continue
+        }
+        if a == "--touch" {
+            mode = "touch"
+            if i + 1 < raw.len() { touch_slot = raw[i + 1] }
+            i = i + 2
+            continue
+        }
+        if a == "--json" { json_out = true; i = i + 1; continue }
+        if a == "--include-phantom" { include_phantom = true; i = i + 1; continue }
+        if a == "--refresh" { refresh = true; i = i + 1; continue }
+        if a == "--policy" { if i + 1 < raw.len() { policy = raw[i + 1] }; i = i + 2; continue }
+        if a == "--exclude" { if i + 1 < raw.len() { exclude_csv = raw[i + 1] }; i = i + 2; continue }
+        if a == "--kind" { if i + 1 < raw.len() { mark_kind = raw[i + 1] }; i = i + 2; continue }
+        if a == "--until-epoch" {
+            if i + 1 < raw.len() {
+                try { mark_until_epoch = to_int(raw[i + 1]) } catch e { mark_until_epoch = 0 }
+            }
+            i = i + 2
+            continue
+        }
+        if a == "--source" { if i + 1 < raw.len() { mark_source = raw[i + 1] }; i = i + 2; continue }
+        if a == "--help" || a == "-h" { _usage(); exit(0) }
+        i = i + 1
+    }
+
+    if mode == "" {
+        _usage()
+        eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=missing-mode")
+        eprintln("reason=missing-mode fix=pass --list | --pick | --mark-cooldown | --touch")
+        exit(1)
+    }
+
+    if mode == "list" {
+        let _ = refresh  // reserved (see header)
+        let slots = _discover_slots()
+        if json_out {
+            // --json is stdout-only; logs go to stderr.
+            print(_emit_slots_json(slots, include_phantom))
+            exit(0)
+        }
+        print(_emit_slots_table(slots, include_phantom))
+        exit(0)
+    }
+
+    if mode == "pick" {
+        let _ = policy  // lru is the only implemented policy in this MVP
+        let slots = _discover_slots()
+        if len(slots) == 0 {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=empty-pool")
+            eprintln("reason=empty-pool fix=ls -1d $HOME/.claude-claude*   # no slot dirs found; run /login in claude CLI to create one")
+            exit(76)
+        }
+        // F-SLOT-PICKER-LIVE-PROBE (2026-04-28): live-API gate iterates
+        // LRU candidates, probes each with `claude -p ping` (cached 30s),
+        // and only returns a slot that actually round-tripped to Anthropic.
+        let idx = _pick_with_live_gate(slots, exclude_csv)
+        if idx >= 0 {
+            let picked = slots[idx]
+            // stdout: just the config_dir, single line — caller pipes into env=
+            println(picked.config_dir)
+            eprintln("__SLOT_PICK_RESULT__ PASS slot=" + picked.slot + " reason=lru-available-live-gated")
+            exit(0)
+        }
+        // FIX 1 (2026-04-27) self-heal on empty pick. Frequent failure mode:
+        // stale 'unknown' slots (never probed since last hexa restart) are
+        // skipped in _pick_lru's available-only filter — but a real probe
+        // would reveal them as available. Inline probe-all + retry once.
+        // F-SLOT-PICKER-LIVE-PROBE addendum: invalidate the live-API cache
+        // before retry, in case revoked tokens were just refreshed by the
+        // user and the 30s cache still says "unhealthy".
+        eprintln("__SLOT_PICK_SELF_HEAL__ probe-all-inline reason=initial-pick-empty")
+        let _rc = _probe_all_slots()
+        let _ic = _health_invalidate_cache()
+        let slots2 = _discover_slots()
+        let idx2 = _pick_with_live_gate(slots2, exclude_csv)
+        if idx2 < 0 {
+            // raw 66 ai-native trailer: all live-probes unhealthy → no slot is
+            // operationally usable.  Caller MUST either (a) run `claude /login`
+            // on at least one revoked profile, or (b) wait for refreshTokens to
+            // be re-validated Anthropic-side, or (c) fall through to raw 66
+            // alternative path (e.g. local docker hard-landing).
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=all-slots-unhealthy-live-probe")
+            eprintln("reason=all-slots-unhealthy-live-probe fix=run 'claude /login' in TTY for any revoked profile (most common cause: refreshToken revoked Anthropic-side); or invalidate cache via --invalidate-cache and retry; or pin to a known-good slot via CLAUDE_CONFIG_DIR override")
+            exit(76)
+        }
+        let picked2 = slots2[idx2]
+        println(picked2.config_dir)
+        eprintln("__SLOT_PICK_RESULT__ PASS slot=" + picked2.slot + " reason=self-healed-after-probe-live-gated")
+        exit(0)
+    }
+
+    if mode == "invalidate-cache" {
+        let rc = _health_invalidate_cache()
+        if rc != 0 {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=cache-invalidate-failed")
+            eprintln("reason=cache-invalidate-failed fix=rm -f /tmp/claude_slot_health/*.cache   # check fs perms")
+            exit(1)
+        }
+        eprintln("__SLOT_PICK_RESULT__ PASS slot=none reason=live-probe-cache-invalidated")
+        exit(0)
+    }
+
+    if mode == "mark" {
+        if mark_slot.len() == 0 {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=missing-slot")
+            eprintln("reason=missing-slot fix=hexa tool/claude_slot_pick.hexa --mark-cooldown <slot> --kind <session|weekly> --until-epoch <unix>")
+            exit(1)
+        }
+        if mark_until_epoch <= 0 {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=" + mark_slot + " reason=missing-until-epoch")
+            eprintln("reason=missing-until-epoch fix=pass --until-epoch <unix-seconds>")
+            exit(1)
+        }
+        let until_iso = _epoch_to_iso(mark_until_epoch)
+        let ok = _write_cooldown(mark_slot, mark_kind, until_iso, mark_source)
+        if !ok {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=" + mark_slot + " reason=cooldown-write-failed")
+            exit(1)
+        }
+        eprintln("__SLOT_PICK_RESULT__ PASS slot=" + mark_slot + " reason=cooldown-marked-" + mark_kind)
+        exit(0)
+    }
+
+    if mode == "touch" {
+        if touch_slot.len() == 0 {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=none reason=missing-slot")
+            eprintln("reason=missing-slot fix=hexa tool/claude_slot_pick.hexa --touch <slot>")
+            exit(1)
+        }
+        let ok = _touch_slot(touch_slot)
+        if !ok {
+            eprintln("__SLOT_PICK_RESULT__ FAIL slot=" + touch_slot + " reason=touch-failed")
+            exit(1)
+        }
+        eprintln("__SLOT_PICK_RESULT__ PASS slot=" + touch_slot + " reason=last-used-touched")
+        exit(0)
+    }
+
+    if mode == "probe-all" {
+        // ISSUE 2 (2026-04-27): proactive pool sweep. Designed for launchd
+        // (com.hive.slot-prober.plist, StartInterval=300). Refreshes
+        // probe_source="live_probe" + last_probe on every healthy/cooled slot
+        // so the LRU --pick has fresh state on all 12 slots, not just the
+        // ones that happened to rotate through dispatch.
+        let rc = _probe_all_slots()
+        if rc != 0 { exit(1) }
+        exit(0)
+    }
+
+    _usage()
+    exit(1)
+}

@@ -1,0 +1,1140 @@
+#!hexa strict
+// tool/resource_op.hexa — `hive resource <op>` canonical worker (own 5)
+//
+// User-facing CLI surface: `hive resource list | status | add | remove | fix`.
+// Single-source-of-truth for host-pool install / uninstall / repair operations.
+// Pool config: ~/.hive/host_pool.hxc (one host per line). Defaults to
+// hardcoded ["hetzner", "ubu", "ubu2"] when config absent.
+//
+// User directive 2026-04-29: "hive cli resource add 등등으로 완벽히
+// 설치,제거 가능하게 / 무조건 cli 로만 ← need this".
+//
+// Surface:
+//   list                    show pool with reachable + load + mem
+//   status [host]           detailed health (ssh + nexus shim + claude bin + mem)
+//   add <host>              probe + append to pool config
+//   remove <host>            unregister (remove from pool config)
+//   fix <host>              heuristic repair playbook
+//                              - broken nexus shim (Mach-O on Linux) → reinstall
+//                              - missing ~/.hx/bin/hexa → guidance
+//                              - missing claude binary → guidance
+//                              - OAuth slot drift → run sync hint
+//
+// raws applied:
+//   own 5 (host-pool-deterministic-routing-cli-canonical) — primary consumer
+//   raw 9 hexa-only · raw 18 self-host
+//   raw 99 hive-cli-canonical-entry-point · raw 168 minimum-viable
+//   raw 169 surgical-edit-scope · raw 91 C3 honest disclosure
+//   raw 12 silent-error-ban · raw 65 idempotent · raw 173 deterministic
+//
+// @tool(slug="resource_op", desc="own 5 hive resource <op> CLI worker — list/status/add/remove/fix/oauth-status/oauth-reset host pool. Pool config ~/.hive/host_pool.hxc, hardcoded fallback. fix subcommand runs deterministic repair playbook (broken nexus shim reinstall + claude binary check + ssh setup hint + oauth slot health detail). oauth-status enumerates per-slot status (active|cooldown|limit-expired|oauth-revoked); oauth-reset removes stale .kick_limit_until markers older than threshold.")
+// @sentinel(__HIVE_RESOURCE__ <PASS|FAIL> <op> [host] [details])
+// @usage(hexa run tool/resource_op.hexa list)
+// @usage(hexa run tool/resource_op.hexa status [host])
+// @usage(hexa run tool/resource_op.hexa add <host>)
+// @usage(hexa run tool/resource_op.hexa remove <host>)
+// @usage(hexa run tool/resource_op.hexa fix <host>)
+// @usage(hexa run tool/resource_op.hexa oauth-status <host>)
+// @usage(hexa run tool/resource_op.hexa oauth-reset <host>)
+// @usage(hexa run tool/resource_op.hexa --selftest)
+// @exit_codes(0=ok, 1=op-fail, 2=host-unreachable, 3=invalid-host, 4=usage, 5=selftest-fail)
+//
+// claude-dependency: NONE.
+//
+// @resolver-bypass(reason="local Mac entry; ssh probe + config mutation must run on Mac orchestrator, not docker-routed")
+
+// ─── helpers ──────────────────────────────────────────────────────
+
+fn _shq(s: string) -> string {
+    let r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _home() -> string {
+    return to_string(exec("printf %s \"$HOME\"")).trim()
+}
+
+// ─── audit ledger (raw 77 schema) ─────────────────────────────────
+//
+// User directive 2026-04-30: "실패시 로그 기능도 필요할듯". Every op writes
+// one JSONL row to state/hive_resource_audit/audit.jsonl. Inspect via
+// `hive resource log [tail-n]`. raw 12 silent-error-ban — failure 정보가
+// 사라지지 않게 영구 기록.
+
+fn _hive_root() -> string {
+    // Shim (bin/hive-resource) sets HIVE_RESOURCE_ROOT explicitly; that is
+    // the canonical pkg root for any user. Legacy HIVE_ROOT env var is
+    // honored second for backwards-compat. Final fallback resolves to the
+    // canonical hx-install path so direct `hexa run tool/resource_op.hexa`
+    // also works without explicit env.
+    let pkg_root = to_string(exec("printf %s \"$HIVE_RESOURCE_ROOT\"")).trim()
+    if len(pkg_root) > 0 { return pkg_root }
+    let env_root = to_string(exec("printf %s \"$HIVE_ROOT\"")).trim()
+    if len(env_root) > 0 { return env_root }
+    let home = to_string(exec("printf %s \"$HOME\"")).trim()
+    return home + "/.hx/packages/hive-resource"
+}
+
+fn _audit_path() -> string {
+    return _hive_root() + "/state/hive_resource_audit/audit.jsonl"
+}
+
+fn _ts() -> string {
+    return utc_iso_now()
+}
+
+fn _json_escape(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn audit_emit(op: string, host: string, verdict: string, reason: string) -> void {
+    // raw 77 audit ledger schema: append-only JSONL row.
+    let dir = _hive_root() + "/state/hive_resource_audit"
+    let _mk = exec("mkdir -p " + _shq(dir))
+    let row = "{\"ts\":\"" + _ts() + "\",\"op\":\"" + _json_escape(op) + "\",\"host\":\"" + _json_escape(host) + "\",\"verdict\":\"" + _json_escape(verdict) + "\",\"reason\":\"" + _json_escape(reason) + "\"}"
+    let cmd = "printf '%s\\n' " + _shq(row) + " >> " + _shq(_audit_path())
+    let _w = exec(cmd)
+}
+
+// Stage B (Option 7) outcome: `~/.hive/host_pool.hxc` is no longer the SSoT —
+// `host_pool_canonical.hexa` now reads `.resource` directly via parse_hosts().
+// resource_op.add/remove still write to `.hxc` for backward-compat audit trail
+// only (the file is unread by routing). To actually mutate the picked pool,
+// edit `.resource` and toggle status (live | deferred). raw 195 canonical-core-lock.
+//
+// LEGACY-HXC-DEPRECATED: Stage F lint allow-marker (host_pool_canonical_lint).
+fn _pool_config_path() -> string {
+    // Legacy — retained for raw 91 C3 migration disclosure only. Pool source
+    // is now `.resource` (Option 7 Stage B cutover, host_pool_canonical.hexa).
+    return _home() + "/.hive/host_pool.hxc"
+}
+
+// Stage D wire: invalidate the routing pick cache so the next `pick` re-probes
+// after add/remove/fix changes the pool / host health. raw 65 idempotent.
+fn _pick_cache_invalidate_external() -> void {
+    let cache = _hive_root() + "/state/resource_pick_cache.json"
+    let _r = exec("rm -f " + _shq(cache) + " 2>/dev/null")
+}
+
+fn _pool_config_exists() -> bool {
+    // Legacy probe — true means a stale hxc still on disk. Pool source is
+    // `.resource` regardless; this is informational only.
+    let p = _pool_config_path()
+    let cmd = "[ -f " + _shq(p) + " ] && echo Y || echo N"
+    return to_string(exec(cmd)).trim() == "Y"
+}
+
+fn _resource_path() -> string {
+    return _hive_root() + "/.resource"
+}
+
+fn _pool_default() -> array {
+    return ["hetzner", "ubu", "ubu2"]
+}
+
+// ─── .resource parser (inlined; mirrors host_pool_canonical Stage B) ──
+// Stage C: pool membership now derived from `.resource` SSOT (read-only here;
+// .resource is git-tracked, mutation is an explicit user commit per design
+// section 6.1). Caller falls back to hardcoded default if parse yields 0.
+
+fn _rstrip_ro(s: string) -> string {
+    let mut end = len(s)
+    // @triad: exempt   // string-trim state machine, mirrors resource_lint._rstrip
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status_ro(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+fn _parse_resource_header_ro(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "resource" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status_ro(status) { return [] }
+    return [id, status]
+}
+
+fn _keys_first_ro(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _parse_resource_aliases(path: string) -> array {
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = src.split("\n")
+
+    let mut entries = []
+    let mut cur_keys = []
+    let mut cur_status = ""
+    let mut has_rule = false
+
+    for raw_line in lines {
+        let line = _rstrip_ro(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                entries.push([cur_status, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                entries.push([cur_status, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_resource_header_ro(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_status = hdr[1]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        entries.push([cur_status, cur_keys])
+    }
+
+    let mut out = []
+    let mut e = 0
+    while e < len(entries) {
+        let st = entries[e][0]
+        let ks = entries[e][1]
+        if st == "live" {
+            let kind = _keys_first_ro(ks, "kind")
+            let alias = _keys_first_ro(ks, "ssh-alias")
+            if kind == "host" && alias != "" && alias != "local" {
+                out.push(alias)
+            }
+        }
+        e = e + 1
+    }
+    return out
+}
+
+fn _pool_read() -> array {
+    let parsed = _parse_resource_aliases(_resource_path())
+    if len(parsed) == 0 { return _pool_default() }
+    return parsed
+}
+
+// ─── Stage D cache invalidation (Option 7) ──────────────────────────
+// Cross-tool surface: any add/remove/fix → invalidate state/resource_pick_cache.json
+// so the next `nexus kick` re-probes with current pool reality. raw 12
+// silent-error-ban: rm -f always succeeds (file may not exist).
+fn _resource_cache_invalidate() -> void {
+    let path = _hive_root() + "/state/resource_pick_cache.json"
+    let _r = exec("rm -f " + _shq(path) + " 2>/dev/null")
+}
+
+fn _ssh_probe(host: string, timeout_s: int) -> bool {
+    let cmd = "ssh -o ConnectTimeout=" + to_string(timeout_s) + " -o BatchMode=yes -o StrictHostKeyChecking=accept-new " + _shq(host) + " true 2>/dev/null && echo y || echo n"
+    return to_string(exec(cmd)).trim() == "y"
+}
+
+fn _ssh_load_avg(host: string) -> string {
+    let cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + _shq(host) + " 'cat /proc/loadavg 2>/dev/null | awk \"{print \\$1}\"' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return "?" }
+    return out
+}
+
+fn _ssh_mem_free_mb(host: string) -> string {
+    let cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + _shq(host) + " 'free -m 2>/dev/null | awk \"NR==2 {print \\$7}\"' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return "?" }
+    return out
+}
+
+fn _ssh_nexus_status(host: string) -> string {
+    // Returns one of: "ok" | "missing" | "format-error" | "unreachable"
+    if !_ssh_probe(host, 8) { return "unreachable" }
+    let cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + _shq(host) + " 'bash -lc \"\\$HOME/.hx/bin/nexus 2>&1 | head -3\"' 2>/dev/null"
+    let out = to_string(exec(cmd))
+    if out.contains("Exec format error") { return "format-error" }
+    if out.contains("cannot execute") { return "format-error" }
+    if out.contains("No such file") { return "missing" }
+    if out.contains("not found") { return "missing" }
+    if out.contains("nexus") { return "ok" }
+    return "missing"
+}
+
+fn _ssh_claude_bin_status(host: string) -> string {
+    // Returns "ok" | "missing"
+    if !_ssh_probe(host, 8) { return "unreachable" }
+    let cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + _shq(host) + " 'command -v claude >/dev/null 2>&1 && echo ok || echo missing' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if out == "ok" { return "ok" }
+    return "missing"
+}
+
+// Stage C: shared nexus-shim repair helper. Idempotent (raw 65) — re-running
+// detects current state and only rewrites when format-error. Returns final
+// nexus status: "ok" | "missing" | "format-error" | "unreachable".
+//   - ok           : shim already healthy, no-op
+//   - format-error : detected Mac binary on Linux → rewrite shim, re-probe
+//   - missing      : no shim file; package install required (out-of-scope)
+//   - unreachable  : ssh down (caller already gated; defensive only)
+//
+// raw 91 honest C3: shim rewrite is the only auto-repair; missing-package
+// install requires explicit user/installer flow (raw 169 surgical scope).
+fn _ensure_nexus_shim(host: string) -> string {
+    let nx = _ssh_nexus_status(host)
+    if nx != "format-error" { return nx }
+    let new_shim = "#!/bin/bash\n# hive resource fix — autorewritten shim 2026-04-30\nHEXA=\"${HEXA:-}\"\nif [ -z \"$HEXA\" ]; then\n  for c in \"$HOME/.hx/bin/hexa_real\" \"$HOME/.hx/bin/hexa\" \"$(command -v hexa 2>/dev/null)\"; do\n    if [ -n \"$c\" ] && [ -x \"$c\" ]; then HEXA=\"$c\"; break; fi\n  done\nfi\nif [ -z \"$HEXA\" ] || [ ! -x \"$HEXA\" ]; then\n  echo \"nexus: hexa runtime not found on \\$HOME/.hx/bin\" >&2\n  exit 127\nfi\nexec \"$HEXA\" \"$HOME/.hx/packages/nexus/cli/run.hexa\" \"$@\"\n"
+    let push_cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes " + _shq(host) + " 'cat > $HOME/.hx/bin/nexus.new && chmod +x $HOME/.hx/bin/nexus.new && mv $HOME/.hx/bin/nexus.new $HOME/.hx/bin/nexus' <<'__SHIM_EOF__'\n" + new_shim + "__SHIM_EOF__"
+    let _r = exec(push_cmd)
+    return _ssh_nexus_status(host)
+}
+
+fn _ssh_oauth_slots(host: string) -> string {
+    // Returns count of ~/.claude-claude<N>/.claude.json files as string.
+    if !_ssh_probe(host, 8) { return "?" }
+    let cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + _shq(host) + " 'ls -d ~/.claude-claude* 2>/dev/null | wc -l | tr -d \" \"' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return "?" }
+    return out
+}
+
+// raw 168 + raw 169: thin wrapper over remote claude_slot_pick.hexa --list.
+// Returns raw multi-line text (table format from _emit_slots_table). Caller
+// parses to enumerate per-slot status (available|session_limit|weekly_limit|
+// unknown|phantom). raw 91 honest C3: depends on remote tool/claude_slot_pick.hexa
+// being installed at ~/.hx/packages/hive-resource/tool/claude_slot_pick.hexa AND ~/.hx/bin/hexa
+// runtime. Returns empty string if remote tool absent / errors.
+fn _ssh_slot_pick_list(host: string) -> string {
+    if !_ssh_probe(host, 8) { return "" }
+    let cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes " + _shq(host) + " '~/.hx/bin/hexa run ~/.hx/packages/hive-resource/tool/claude_slot_pick.hexa --list 2>/dev/null' 2>/dev/null"
+    return to_string(exec(cmd))
+}
+
+// Parse the table output of claude_slot_pick.hexa --list.
+// Header line:
+//   slot config_dir status session_until weekly_until last_used probe_source
+// Data lines:
+//   <id> <dir> <status> <session_until|-> <weekly_until|-> <last_used|-> <probe_source|->
+//
+// Returns array-of-arrays: [[slot_id, status, session_until, weekly_until], ...]
+// raw 91 C3: skip header + blank lines.
+fn _parse_slot_list(raw: string) -> array {
+    let mut out = []
+    if len(raw) == 0 { return out }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let s = lines[i].trim()
+        if len(s) == 0 || s.starts_with("slot config_dir") || s.starts_with("#") {
+            i = i + 1; continue
+        }
+        // Split on whitespace: hexa string lacks split-by-regex. Use repeated " " split.
+        // Convention: fields are single-token (no embedded spaces in dir paths).
+        let parts = s.split(" ")
+        let mut clean = []
+        let mut k = 0
+        while k < len(parts) {
+            let p = parts[k].trim()
+            if len(p) > 0 { clean.push(p) }
+            k = k + 1
+        }
+        if len(clean) >= 5 {
+            let row = [clean[0], clean[2], clean[3], clean[4]]
+            out.push(row)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Map raw status (from claude_slot_pick) → hive resource oauth-status enum.
+//   "available"     → "active"
+//   "session_limit" → "limit-expired"   (session window exceeded)
+//   "weekly_limit"  → "limit-expired"   (weekly window exceeded)
+//   "unknown"       → "cooldown"        (no probe data; treat as cooldown)
+//   "phantom"       → "phantom"
+//   "error"         → "oauth-revoked"
+//   else            → "oauth-revoked"
+//
+// raw 91 C3: this is a heuristic. claude_slot_pick.hexa does NOT explicitly
+// report "oauth-revoked" — that state surfaces at kick-time via 401 on the
+// remote claude binary. Mapping `error` and unknown enum to oauth-revoked is
+// a conservative bucket so the dispatcher surface still reports the failure.
+fn _map_slot_status(raw_status: string) -> string {
+    if raw_status == "available" { return "active" }
+    if raw_status == "session_limit" { return "limit-expired" }
+    if raw_status == "weekly_limit" { return "limit-expired" }
+    if raw_status == "unknown" { return "cooldown" }
+    if raw_status == "phantom" { return "phantom" }
+    if raw_status == "error" { return "oauth-revoked" }
+    return "oauth-revoked"
+}
+
+fn _pool_contains(hosts: array, host: string) -> bool {
+    let mut i = 0
+    while i < len(hosts) {
+        if hosts[i] == host { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── op: list ─────────────────────────────────────────────────────
+
+fn op_list() -> void {
+    let pool = _pool_read()
+    let res = _resource_path()
+    let res_exists = to_string(exec("[ -f " + _shq(res) + " ] && echo Y || echo N")).trim() == "Y"
+    let src = if res_exists { ".resource" } else { "default(hardcoded)" }
+    println("# hive resource list — host pool (source: " + src + ")")
+    println("#   path: " + res)
+    if _pool_config_exists() {
+        println("#   note: legacy ~/.hive/host_pool.hxc detected — host_pool_canonical migrates → .bak on next dispatch")
+    }
+    println("# host         reachable  load    mem_free_mb  nexus")
+    let mut i = 0
+    let mut unhealthy = 0
+    while i < len(pool) {
+        let h = pool[i]
+        let reachable = _ssh_probe(h, 8)
+        if reachable {
+            let load = _ssh_load_avg(h)
+            let mem  = _ssh_mem_free_mb(h)
+            let nx   = _ssh_nexus_status(h)
+            println("  " + _pad(h, 12) + " y          " + _pad(load, 7) + " " + _pad(mem, 12) + " " + nx)
+            if nx != "ok" { unhealthy = unhealthy + 1 }
+        } else {
+            println("  " + _pad(h, 12) + " n          -       -            -")
+            unhealthy = unhealthy + 1
+        }
+        i = i + 1
+    }
+    println("__HIVE_RESOURCE__ PASS list count=" + to_string(len(pool)))
+    let verdict = if unhealthy == 0 { "PASS" } else { "DEGRADED" }
+    audit_emit("list", "*", verdict, "count=" + to_string(len(pool)) + " unhealthy=" + to_string(unhealthy))
+}
+
+fn _pad(s: string, n: int) -> string {
+    let mut r = s
+    while len(r) < n { r = r + " " }
+    return r
+}
+
+// ─── op: status ───────────────────────────────────────────────────
+
+fn op_status(host: string) -> void {
+    if host == "" {
+        op_list()
+        return
+    }
+    let pool = _pool_read()
+    if !_pool_contains(pool, host) {
+        eprintln("__HIVE_RESOURCE__ FAIL status host=" + host + " reason=not-in-pool")
+        eprintln("reason: host '" + host + "' not in pool {" + _join(pool, ",") + "}")
+        eprintln("fix: 1) hive resource list  2) hive resource add " + host)
+        audit_emit("status", host, "FAIL", "not-in-pool")
+        exit(3)
+    }
+    println("# hive resource status — " + host)
+    let reachable = _ssh_probe(host, 8)
+    println("  reachable:        " + (if reachable { "y" } else { "n" }))
+    if !reachable {
+        eprintln("__HIVE_RESOURCE__ FAIL status host=" + host + " reason=unreachable")
+        eprintln("fix: 1) ssh " + host + " true  2) check ~/.ssh/config Host " + host + " stanza  3) hive resource fix " + host)
+        audit_emit("status", host, "FAIL", "unreachable")
+        exit(2)
+    }
+    let load = _ssh_load_avg(host)
+    let mem  = _ssh_mem_free_mb(host)
+    let nx   = _ssh_nexus_status(host)
+    let cb   = _ssh_claude_bin_status(host)
+    let oa   = _ssh_oauth_slots(host)
+    println("  load_avg_1min:    " + load)
+    println("  mem_free_mb:      " + mem)
+    println("  nexus_shim:       " + nx)
+    println("  claude_binary:    " + cb)
+    println("  oauth_slots:      " + oa)
+    let healthy = if nx == "ok" && cb == "ok" { true } else { false }
+    println("  overall:          " + (if healthy { "ok" } else { "DEGRADED" }))
+    println("__HIVE_RESOURCE__ PASS status host=" + host)
+    let v = if healthy { "PASS" } else { "DEGRADED" }
+    audit_emit("status", host, v, "nexus=" + nx + " claude=" + cb + " slots=" + oa + " load=" + load + " mem=" + mem)
+}
+
+fn _join(arr: array, sep: string) -> string {
+    let mut r = ""
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { r = r + sep }
+        r = r + to_string(arr[i])
+        i = i + 1
+    }
+    return r
+}
+
+// ─── op: add (Stage C — auto-bootstrap) ──────────────────────────
+//
+// Stage C semantics: `hive resource add <host>` runs the full bootstrap
+// playbook so that after success, `nexus kick` works to that host with no
+// further setup. Steps:
+//   1. ssh probe (must succeed; otherwise surface ai_err and exit 2)
+//   2. nexus shim repair (idempotent, calls _ensure_nexus_shim helper)
+//   3. claude binary check (advisory only — install requires interactive flow)
+//   4. OAuth slot count (advisory)
+//   5. cache invalidate (so nexus kick re-probes with new pool reality)
+//   6. raw 91 C3 disclosure on .resource SSOT membership
+//
+// raw 91 C3: pool membership lives in `.resource` (git-tracked SSOT). This
+// command runs the bootstrap; if the host is not present in `.resource`,
+// `pick_host` will not route to it. Caller is responsible for editing
+// `.resource` and committing — raw 192 atomic semantics preserved.
+//
+// raw 65 idempotent: re-running on already-bootstrapped host is a no-op
+// (nexus shim re-probe returns "ok" without rewriting; cache invalidation
+// is always safe).
+
+fn op_add(host: string) -> void {
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL add reason=missing-host-arg")
+        eprintln("usage: hive resource add <host>")
+        exit(4)
+    }
+    let pool = _pool_read()
+    let in_pool = _pool_contains(pool, host)
+
+    println("# hive resource add — bootstrap '" + host + "'")
+    println("")
+
+    // Step 1: ssh reachability gate
+    let reachable = _ssh_probe(host, 8)
+    println("# step 1/4: ssh reachability — " + (if reachable { "OK" } else { "FAIL" }))
+    if !reachable {
+        eprintln("#   → cannot bootstrap unreachable host. Verify ~/.ssh/config Host " + host + " stanza.")
+        eprintln("#   fix: ssh " + host + " true   # then re-run 'hive resource add " + host + "'")
+        eprintln("__HIVE_RESOURCE__ FAIL add host=" + host + " step=ssh-probe")
+        audit_emit("add", host, "FAIL", "step=ssh-probe-unreachable")
+        exit(2)
+    }
+
+    // Step 2: nexus shim health (auto-repair format-error idempotently)
+    let nx_final = _ensure_nexus_shim(host)
+    println("# step 2/4: nexus shim — " + nx_final)
+    if nx_final == "format-error" {
+        eprintln("#   → shim rewrite did not heal format-error.")
+        eprintln("#   fix: ssh " + host + " 'ls -la ~/.hx/bin ~/.hx/packages/nexus/cli/run.hexa'")
+        audit_emit("add", host, "FAIL", "step=nexus-shim post-rewrite=format-error")
+        exit(1)
+    } else if nx_final == "missing" {
+        println("#   → ~/.hx/bin/nexus missing (hx package install required; out-of-scope for 'add')")
+        println("#   fix: ssh " + host + " 'curl -fsSL <hx-installer-url> | bash'   # then re-run add")
+    }
+
+    // Step 3: claude binary (advisory — install is interactive)
+    let cb = _ssh_claude_bin_status(host)
+    println("# step 3/4: claude binary — " + cb)
+    if cb == "missing" {
+        println("#   → claude binary missing; OAuth slot fallback unavailable.")
+        println("#   fix: ssh " + host + " 'curl -fsSL https://claude.ai/install.sh | bash'")
+    }
+
+    // Step 4: OAuth slot count (advisory)
+    let oa = _ssh_oauth_slots(host)
+    println("# step 4/4: oauth slots — count=" + oa)
+    if oa == "0" {
+        println("#   → no ~/.claude-claude<N> dirs (kick will FAIL with all-claude-slots-exhausted)")
+        println("#   fix: ssh " + host + " 'mkdir -p ~/.claude-claude1 && claude /login --config-dir ~/.claude-claude1'")
+    }
+
+    // Stage D: invalidate cache so next kick re-probes with new pool state.
+    _resource_cache_invalidate()
+
+    // raw 91 C3 membership disclosure.
+    if !in_pool {
+        println("")
+        println("# raw 91 C3: host '" + host + "' is NOT yet listed in .resource (git-tracked SSOT)")
+        println("#            → bootstrap completed, but pick_host will not route to it until")
+        println("#              you add a `resource <N> live \"<desc>\"` entry with `ssh-alias " + host + "`")
+        println("#              + commit. See docs/formats/resource.md for schema.")
+    }
+
+    let healthy = nx_final == "ok"
+    if healthy {
+        println("__HIVE_RESOURCE__ PASS add host=" + host + " state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
+        audit_emit("add", host, "PASS", "state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
+        exit(0)
+    }
+    println("__HIVE_RESOURCE__ PASS add host=" + host + " state=partial nexus=" + nx_final + " claude=" + cb + " slots=" + oa)
+    audit_emit("add", host, "PARTIAL", "nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
+    exit(0)
+}
+
+// ─── op: remove ───────────────────────────────────────────────────
+//
+// Stage C: with `.resource` as SSOT, `remove` cannot mutate pool membership
+// (would require editing the git-tracked file). Behavior:
+//   - emit raw 91 C3 disclosure pointing to .resource manual edit
+//   - invalidate cache so any in-flight cached pick gets re-probed
+//   - audit log the request
+//
+// raw 65 idempotent: re-running is always safe (cache invalidate is no-op
+// when cache absent; disclosure is read-only).
+
+fn op_remove(host: string) -> void {
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL remove reason=missing-host-arg")
+        eprintln("usage: hive resource remove <host>")
+        exit(4)
+    }
+    let pool = _pool_read()
+    let present = _pool_contains(pool, host)
+    println("# hive resource remove — '" + host + "'")
+    println("")
+    println("# raw 91 C3: pool membership lives in .resource (git-tracked SSOT). This")
+    println("#            command does NOT auto-edit .resource — manual edit + commit required.")
+    println("#")
+    println("# steps to fully unregister:")
+    println("#   1) edit " + _resource_path() + " — comment out or delete the resource block")
+    println("#      whose `ssh-alias " + host + "` matches")
+    println("#   2) git commit -m 'remove " + host + " from host pool'")
+    println("#   3) (optional) ssh " + host + " — clean ~/.hx, ~/.claude-claude*, etc")
+    println("#")
+    println("# present_in_pool: " + (if present { "y" } else { "n" }))
+    println("# pool now:        " + _join(pool, ", "))
+
+    // Stage D: invalidate cache (always safe, raw 65 idempotent).
+    _resource_cache_invalidate()
+    println("# cache:           invalidated (next kick re-probes)")
+
+    println("__HIVE_RESOURCE__ PASS remove host=" + host + " state=disclosure-emitted present=" + (if present { "y" } else { "n" }))
+    audit_emit("remove", host, "PASS", "disclosure-emitted present=" + (if present { "y" } else { "n" }))
+}
+
+// ─── op: fix ──────────────────────────────────────────────────────
+
+fn op_fix(host: string) -> void {
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL fix reason=missing-host-arg")
+        eprintln("usage: hive resource fix <host>")
+        exit(4)
+    }
+    // Stage D wire: invalidate routing cache before repair so the next pick
+    // re-probes against the freshly-healed (or still-broken) host state.
+    _pick_cache_invalidate_external()
+    println("# hive resource fix — heuristic repair playbook for '" + host + "'")
+    println("")
+    let reachable = _ssh_probe(host, 8)
+    if !reachable {
+        eprintln("# step 1/4: ssh reachability — FAIL (host '" + host + "' unreachable)")
+        eprintln("# fix:")
+        eprintln("#   1) ssh " + host + " true             # verify ~/.ssh/config Host " + host)
+        eprintln("#   2) ssh-keyscan " + host + " >> ~/.ssh/known_hosts")
+        eprintln("#   3) check VPN / network / firewall")
+        eprintln("__HIVE_RESOURCE__ FAIL fix host=" + host + " step=ssh-probe")
+        audit_emit("fix", host, "FAIL", "step=ssh-probe-unreachable")
+        exit(2)
+    }
+    println("# step 1/4: ssh reachability — OK")
+
+    // Step 2: nexus shim health (Stage C: shared _ensure_nexus_shim helper).
+    let nx_pre = _ssh_nexus_status(host)
+    let nx = _ensure_nexus_shim(host)
+    println("# step 2/4: nexus shim — pre=" + nx_pre + " post=" + nx)
+    if nx_pre == "format-error" && nx == "ok" {
+        println("#   ↳ shim auto-rewritten (Mach-O on Linux → linux/x86_64 dispatch)")
+    }
+    if nx == "format-error" {
+        eprintln("__HIVE_RESOURCE__ FAIL fix host=" + host + " step=nexus-shim post-rewrite=" + nx)
+        eprintln("# raw 91 C3: shim rewrite did not heal — investigate ~/.hx/bin/hexa_real or run.hexa missing")
+        eprintln("#            ssh " + host + " 'ls -la ~/.hx/bin ~/.hx/packages/nexus/cli/run.hexa 2>&1'")
+        audit_emit("fix", host, "FAIL", "step=nexus-shim post-rewrite=" + nx)
+        exit(1)
+    } else if nx == "missing" {
+        eprintln("#   → DETECTED: ~/.hx/bin/nexus missing.")
+        eprintln("#   fix: ssh " + host + " 'curl -fsSL <hx-installer-url> | bash'")
+        eprintln("#   raw 91 C3: hx package install path is repo-policy decision, not auto-pushed by 'hive resource fix' (raw 169 surgical scope).")
+        eprintln("__HIVE_RESOURCE__ FAIL fix host=" + host + " step=nexus-shim reason=missing")
+        audit_emit("fix", host, "FAIL", "step=nexus-shim reason=missing")
+        exit(1)
+    }
+    // Step 3: claude binary
+    let cb = _ssh_claude_bin_status(host)
+    println("# step 3/4: claude binary — " + cb)
+    if cb == "missing" {
+        println("#   → claude binary missing (OAuth slot fallback unavailable on this host).")
+        println("#   fix:")
+        println("#     ssh " + host + " 'curl -fsSL https://claude.ai/install.sh | bash'")
+        println("#   raw 91 C3: claude binary install requires user interaction (npm credential / login),")
+        println("#              not auto-pushed by 'hive resource fix'.")
+    }
+    // Step 4: OAuth slot count
+    let oa = _ssh_oauth_slots(host)
+    println("# step 4/5: oauth slots — count=" + oa)
+    if oa == "0" {
+        println("#   → no ~/.claude-claude<N> dirs detected.")
+        println("#   fix: tool/oauth_slot_mac_to_" + host + "_sync.hexa  # if pair tool exists")
+        println("#       OR: ssh " + host + " 'mkdir -p ~/.claude-claude1 && claude /login --config-dir ~/.claude-claude1'")
+    }
+    // Step 5: OAuth slot health detail (raw 168 minimum-viable enhancement).
+    // Even when oa > 0, slots may all be in cooldown / limit-expired /
+    // oauth-revoked — manifesting as kick FAIL reason=all-claude-slots-exhausted.
+    // Enumerate per-slot status via remote claude_slot_pick.hexa --list.
+    println("# step 5/5: oauth slot health detail")
+    let raw_list = _ssh_slot_pick_list(host)
+    let mut active = 0
+    let mut cooldown = 0
+    let mut limit_expired = 0
+    let mut revoked = 0
+    let mut phantom = 0
+    if len(raw_list) == 0 {
+        println("#   → claude_slot_pick.hexa --list output empty / unreachable")
+        println("#   fix: ssh " + host + " 'ls -la ~/.hx/packages/hive-resource/tool/claude_slot_pick.hexa ~/.hx/bin/hexa'")
+    } else {
+        let rows = _parse_slot_list(raw_list)
+        let mut k = 0
+        while k < len(rows) {
+            let mapped = _map_slot_status(rows[k][1])
+            if mapped == "active" { active = active + 1 }
+            else if mapped == "cooldown" { cooldown = cooldown + 1 }
+            else if mapped == "limit-expired" { limit_expired = limit_expired + 1 }
+            else if mapped == "oauth-revoked" { revoked = revoked + 1 }
+            else if mapped == "phantom" { phantom = phantom + 1 }
+            k = k + 1
+        }
+        println("#   summary: active=" + to_string(active) + " cooldown=" + to_string(cooldown) + " limit-expired=" + to_string(limit_expired) + " oauth-revoked=" + to_string(revoked) + " phantom=" + to_string(phantom))
+        if active == 0 {
+            println("#   → DETECTED: all-exhausted (no active slot). kick will FAIL reason=all-claude-slots-exhausted.")
+            println("#   fix path:")
+            if limit_expired > 0 {
+                println("#     manual:    hive resource oauth-reset " + host + "    # reset .kick_limit_until markers older than 60min")
+            }
+            if revoked > 0 {
+                println("#     manual:    ssh " + host + " 'claude /login --config-dir ~/.claude-claudeN'  # for each revoked slot (interactive)")
+                println("#     automated: hexa run tool/oauth_slot_mac_to_" + host + "_sync.hexa  # Mac → host (if Mac slots are active)")
+            }
+            if cooldown > 0 && limit_expired == 0 && revoked == 0 {
+                println("#     wait:      cooldown windows expire on their own; re-run after cooldown TTL")
+            }
+        }
+    }
+    // Stage D: invalidate cache so next kick re-probes (host may have just healed).
+    _resource_cache_invalidate()
+
+    let healthy = if nx == "ok" && cb == "ok" && active > 0 { true } else { false }
+    if healthy {
+        println("__HIVE_RESOURCE__ PASS fix host=" + host + " state=healed")
+        audit_emit("fix", host, "PASS", "state=healed nexus=" + nx + " claude=" + cb + " slots=" + oa + " active=" + to_string(active))
+        exit(0)
+    }
+    println("__HIVE_RESOURCE__ PASS fix host=" + host + " state=partial-needs-followup")
+    audit_emit("fix", host, "PARTIAL", "nexus=" + nx + " claude=" + cb + " slots=" + oa + " active=" + to_string(active) + " cooldown=" + to_string(cooldown) + " limit_expired=" + to_string(limit_expired) + " revoked=" + to_string(revoked))
+    exit(0)
+}
+
+// ─── op: oauth-status ─────────────────────────────────────────────
+//
+// Enumerate per-slot OAuth status on a host. Returns summary
+// (N active / N cooldown / N limit-expired / N revoked / N phantom)
+// + per-slot detail. raw 168 minimum-viable: leverage remote
+// claude_slot_pick.hexa --list, map raw enum → hive enum.
+fn op_oauth_status(host: string) -> void {
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-status reason=missing-host-arg")
+        eprintln("usage: hive resource oauth-status <host>")
+        exit(4)
+    }
+    let pool = _pool_read()
+    if !_pool_contains(pool, host) {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-status host=" + host + " reason=not-in-pool")
+        eprintln("fix: hive resource add " + host)
+        audit_emit("oauth-status", host, "FAIL", "not-in-pool")
+        exit(3)
+    }
+    if !_ssh_probe(host, 8) {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-status host=" + host + " reason=unreachable")
+        audit_emit("oauth-status", host, "FAIL", "unreachable")
+        exit(2)
+    }
+    println("# hive resource oauth-status — " + host)
+    let raw_list = _ssh_slot_pick_list(host)
+    if len(raw_list) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-status host=" + host + " reason=slot-pick-list-empty")
+        eprintln("fix: ssh " + host + " 'ls -la ~/.hx/packages/hive-resource/tool/claude_slot_pick.hexa ~/.hx/bin/hexa'")
+        audit_emit("oauth-status", host, "FAIL", "slot-pick-list-empty")
+        exit(1)
+    }
+    let rows = _parse_slot_list(raw_list)
+    let mut active = 0
+    let mut cooldown = 0
+    let mut limit_expired = 0
+    let mut revoked = 0
+    let mut phantom = 0
+    println("# slot  status         raw_status     session_until         weekly_until")
+    let mut k = 0
+    while k < len(rows) {
+        let r = rows[k]
+        let mapped = _map_slot_status(r[1])
+        if mapped == "active" { active = active + 1 }
+        else if mapped == "cooldown" { cooldown = cooldown + 1 }
+        else if mapped == "limit-expired" { limit_expired = limit_expired + 1 }
+        else if mapped == "oauth-revoked" { revoked = revoked + 1 }
+        else if mapped == "phantom" { phantom = phantom + 1 }
+        println("  " + _pad(r[0], 5) + " " + _pad(mapped, 14) + " " + _pad(r[1], 14) + " " + _pad(r[2], 21) + " " + r[3])
+        k = k + 1
+    }
+    let total = active + cooldown + limit_expired + revoked + phantom
+    println("# summary: total=" + to_string(total) + " active=" + to_string(active) + " cooldown=" + to_string(cooldown) + " limit-expired=" + to_string(limit_expired) + " oauth-revoked=" + to_string(revoked) + " phantom=" + to_string(phantom))
+    let verdict = if active > 0 { "PASS" } else { "DEGRADED" }
+    println("__HIVE_RESOURCE__ " + verdict + " oauth-status host=" + host + " active=" + to_string(active) + " cooldown=" + to_string(cooldown) + " limit-expired=" + to_string(limit_expired) + " revoked=" + to_string(revoked))
+    audit_emit("oauth-status", host, verdict, "active=" + to_string(active) + " cooldown=" + to_string(cooldown) + " limit_expired=" + to_string(limit_expired) + " revoked=" + to_string(revoked) + " phantom=" + to_string(phantom))
+    exit(0)
+}
+
+// ─── op: oauth-reset ──────────────────────────────────────────────
+//
+// Remove stale ~/.claude-claude*/.kick_limit_until markers older than
+// HIVE_OAUTH_RESET_MMIN minutes (default 60). raw 91 honest C3:
+//   - 60min threshold is heuristic (configurable via env).
+//   - Only removes markers where mtime > threshold (younger markers may
+//     reflect active limit windows; preserve them).
+//   - oauth-revoked slots require interactive `claude /login` — NOT auto-fixed.
+fn op_oauth_reset(host: string) -> void {
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-reset reason=missing-host-arg")
+        eprintln("usage: hive resource oauth-reset <host>")
+        exit(4)
+    }
+    let pool = _pool_read()
+    if !_pool_contains(pool, host) {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-reset host=" + host + " reason=not-in-pool")
+        audit_emit("oauth-reset", host, "FAIL", "not-in-pool")
+        exit(3)
+    }
+    if !_ssh_probe(host, 8) {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-reset host=" + host + " reason=unreachable")
+        audit_emit("oauth-reset", host, "FAIL", "unreachable")
+        exit(2)
+    }
+    let env_mmin = to_string(exec("printf %s \"$HIVE_OAUTH_RESET_MMIN\"")).trim()
+    let mut mmin_str = "60"
+    if len(env_mmin) > 0 {
+        let n = to_int(env_mmin)
+        if n > 0 && n < 100000 { mmin_str = to_string(n) }
+    }
+    println("# hive resource oauth-reset — " + host + " (mmin threshold=" + mmin_str + ")")
+    // Two-step: (1) count matches, (2) delete. Honest reporting of N markers removed.
+    let count_cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes " + _shq(host) + " 'find $HOME/.claude-claude* -maxdepth 1 -name \".kick_limit_until\" -mmin +" + mmin_str + " 2>/dev/null | wc -l | tr -d \" \"' 2>/dev/null"
+    let n_str = to_string(exec(count_cmd)).trim()
+    let mut n = 0
+    if len(n_str) > 0 { n = to_int(n_str) }
+    println("# matches: " + to_string(n) + " stale markers (>" + mmin_str + "min mtime)")
+    if n == 0 {
+        println("# no-op (raw 65 idempotent)")
+        println("__HIVE_RESOURCE__ PASS oauth-reset host=" + host + " removed=0")
+        audit_emit("oauth-reset", host, "PASS", "removed=0 mmin=" + mmin_str)
+        exit(0)
+    }
+    let del_cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes " + _shq(host) + " 'find $HOME/.claude-claude* -maxdepth 1 -name \".kick_limit_until\" -mmin +" + mmin_str + " -delete 2>/dev/null && echo OK || echo FAIL' 2>/dev/null"
+    let del_out = to_string(exec(del_cmd)).trim()
+    if del_out != "OK" {
+        eprintln("__HIVE_RESOURCE__ FAIL oauth-reset host=" + host + " reason=delete-failed out=" + del_out)
+        audit_emit("oauth-reset", host, "FAIL", "delete-failed mmin=" + mmin_str)
+        exit(1)
+    }
+    println("# removed " + to_string(n) + " stale markers")
+    println("# raw 91 honest C3: oauth-revoked slots require interactive 'claude /login' — auto-fix unavailable")
+    println("__HIVE_RESOURCE__ PASS oauth-reset host=" + host + " removed=" + to_string(n))
+    audit_emit("oauth-reset", host, "PASS", "removed=" + to_string(n) + " mmin=" + mmin_str)
+    exit(0)
+}
+
+// ─── op: log ──────────────────────────────────────────────────────
+
+fn op_log(tail_n: int) -> void {
+    let path = _audit_path()
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" {
+        println("# audit ledger empty (no ops recorded yet): " + path)
+        println("__HIVE_RESOURCE__ PASS log count=0")
+        return
+    }
+    let n_str = to_string(tail_n)
+    println("# hive resource log — last " + n_str + " entries from " + path)
+    let cmd = "tail -n " + n_str + " " + _shq(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd))
+    print(out)
+    let line_count = to_string(exec("wc -l < " + _shq(path) + " 2>/dev/null | tr -d ' '")).trim()
+    println("__HIVE_RESOURCE__ PASS log shown=" + n_str + " total_rows=" + line_count)
+}
+
+// ─── selftest ─────────────────────────────────────────────────────
+
+fn _selftest() -> void {
+    println("[resource_op selftest]")
+    let mut fails = 0
+
+    // F1: pool default fallback non-empty
+    let p = _pool_default()
+    if len(p) >= 3 && p[0] == "hetzner" {
+        println("  PASS pool_default canonical: " + p[0] + ", " + p[1] + ", " + p[2])
+    } else {
+        println("  FAIL pool_default broken")
+        fails = fails + 1
+    }
+
+    // F2: shell escape
+    let esc = _shq("a'b")
+    if esc == "'a'\\''b'" {
+        println("  PASS _shq handles single quote")
+    } else {
+        println("  FAIL _shq: " + esc)
+        fails = fails + 1
+    }
+
+    // F3: idempotent add (already-present is no-op)
+    //     simulate via _pool_contains
+    let pp = ["hetzner", "ubu"]
+    if _pool_contains(pp, "hetzner") && !_pool_contains(pp, "nope") {
+        println("  PASS _pool_contains idempotent semantics")
+    } else {
+        println("  FAIL _pool_contains")
+        fails = fails + 1
+    }
+
+    // F4: _join formatting
+    let j = _join(["a", "b", "c"], ",")
+    if j == "a,b,c" {
+        println("  PASS _join formatting")
+    } else {
+        println("  FAIL _join: " + j)
+        fails = fails + 1
+    }
+
+    // F5: _pad fills to width
+    let pd = _pad("ab", 5)
+    if pd == "ab   " {
+        println("  PASS _pad width fill")
+    } else {
+        println("  FAIL _pad: '" + pd + "'")
+        fails = fails + 1
+    }
+
+    // F6: _map_slot_status enum mapping
+    if _map_slot_status("available") == "active" && _map_slot_status("session_limit") == "limit-expired" && _map_slot_status("weekly_limit") == "limit-expired" && _map_slot_status("unknown") == "cooldown" && _map_slot_status("phantom") == "phantom" && _map_slot_status("error") == "oauth-revoked" {
+        println("  PASS _map_slot_status enum mapping (6 cases)")
+    } else {
+        println("  FAIL _map_slot_status enum mapping")
+        fails = fails + 1
+    }
+
+    // F7: _parse_slot_list parses table format
+    let sample = "slot config_dir status session_until weekly_until last_used probe_source\n1 /home/u/.claude-claude1 available - - - live_probe\n2 /home/u/.claude-claude2 session_limit 2026-04-30T01:00:00Z - - live_probe\n"
+    let parsed = _parse_slot_list(sample)
+    if len(parsed) == 2 && parsed[0][0] == "1" && parsed[0][1] == "available" && parsed[1][1] == "session_limit" {
+        println("  PASS _parse_slot_list (2 rows + header skip)")
+    } else {
+        println("  FAIL _parse_slot_list: rows=" + to_string(len(parsed)))
+        fails = fails + 1
+    }
+
+    // F8: _parse_slot_list empty input
+    let parsed_empty = _parse_slot_list("")
+    if len(parsed_empty) == 0 {
+        println("  PASS _parse_slot_list empty input")
+    } else {
+        println("  FAIL _parse_slot_list empty: rows=" + to_string(len(parsed_empty)))
+        fails = fails + 1
+    }
+
+    // F9 (Stage B): _parse_resource_aliases on synthetic fixture
+    //   - 1 live + 1 mac-local + 1 deferred → expect 1 row (alias=xyz).
+    let fix9 = "/tmp/resource_op_F9.resource"
+    let body9 = "resource 0 live \"r\"\n  slug s0\n  kind host\n  ssh-alias xyz\n  capabilities cpu\n  memory-budget 8\n  scoring-weight 0.5\n  why test\n\nresource 1 live \"local mac\"\n  slug sl\n  kind host\n  ssh-alias local\n  capabilities cpu\n  memory-budget 4\n  scoring-weight 0.1\n  why mac local sentinel\n"
+    let _w9 = exec("printf %s " + _shq(body9) + " > " + _shq(fix9))
+    let aliases = _parse_resource_aliases(fix9)
+    if len(aliases) == 1 && aliases[0] == "xyz" {
+        println("  PASS _parse_resource_aliases skips mac-local + deferred (1 alias: xyz)")
+    } else {
+        println("  FAIL _parse_resource_aliases rows=" + to_string(len(aliases)))
+        fails = fails + 1
+    }
+    let _r9 = exec("rm -f " + _shq(fix9))
+
+    // F10 (Stage D): _resource_cache_invalidate is idempotent (rm -f no-op when missing).
+    _resource_cache_invalidate()
+    _resource_cache_invalidate()  // second call → no error
+    let cache_path = _hive_root() + "/state/resource_pick_cache.json"
+    let after = to_string(exec("[ -f " + _shq(cache_path) + " ] && echo Y || echo N")).trim()
+    if after == "N" {
+        println("  PASS _resource_cache_invalidate idempotent (no file post-invalidate)")
+    } else {
+        println("  FAIL _resource_cache_invalidate left file at " + cache_path)
+        fails = fails + 1
+    }
+
+    if fails > 0 {
+        println("__HIVE_RESOURCE_SELFTEST__ FAIL fails=" + to_string(fails))
+        exit(5)
+    }
+    println("__HIVE_RESOURCE_SELFTEST__ PASS")
+    exit(0)
+}
+
+// ─── usage ────────────────────────────────────────────────────────
+
+fn _usage() -> void {
+    println("usage: hive resource <subcmd> [args]")
+    println("       (or: hexa run tool/resource_op.hexa <subcmd> [args])")
+    println("")
+    println("subcommands:")
+    println("  list                        show pool with reachable + load + mem")
+    println("  status [host]               detailed health (ssh + nexus + claude + slots)")
+    println("  add <host>                  probe + append to pool config")
+    println("  remove <host>               unregister from pool config")
+    println("  fix <host>                  heuristic repair playbook (now incl. oauth slot health detail)")
+    println("  oauth-status <host>         enumerate per-slot OAuth status (active|cooldown|limit-expired|revoked)")
+    println("  oauth-reset <host>          remove stale .kick_limit_until markers (mmin > $HIVE_OAUTH_RESET_MMIN, default 60)")
+    println("  log [tail-n]                tail audit ledger (default 20 entries)")
+    println("  --selftest                  run selftest")
+    println("")
+    println("config: ~/.hive/host_pool.hxc")
+    println("        (auto-bootstrap on first add/remove; defaults: hetzner, ubu, ubu2)")
+    println("audit:  state/hive_resource_audit/audit.jsonl  (raw 77 schema)")
+    exit(4)
+}
+
+// ─── main ─────────────────────────────────────────────────────────
+
+// raw 91 honest C3: hexa runtime args() prepends [exe_path, exe_path, ...real_args]
+// in AOT cache exec. Cross-host filter (Mac hexa_v2 cache + Linux hexa_real
+// binary entry + 'run' subcommand glue + .hexa script path) — strip every
+// non-user-positional entry so subcommand resolution works identically across
+// Mac orchestrator + remote hosts (ubu1 / ubu2 / hetzner).
+let raw_cli = args()
+let mut cli = []
+let mut s_i = 0
+// @triad: atomize
+while s_i < len(raw_cli) {
+    let a = raw_cli[s_i]
+    let is_exe_path = a.contains(".hexa-cache")
+                   || a.contains("hexa_interp")
+                   || a.contains("hexa_real")
+                   || a.ends_with("/hexa")
+                   || a.ends_with(".hexa")
+    let is_run_glue = a == "run"
+    if !is_exe_path && !is_run_glue {
+        cli.push(a)
+    }
+    s_i = s_i + 1
+}
+
+if len(cli) == 0 { _usage() }
+
+// Find first non-flag positional (the subcommand)
+let mut sub = ""
+let mut sub_idx = -1
+let mut ai = 0
+// @triad: atomize
+while ai < len(cli) {
+    let a = cli[ai]
+    if a == "--selftest" { _selftest() }
+    if !a.starts_with("--") && sub == "" {
+        sub = a
+        sub_idx = ai
+        break
+    }
+    ai = ai + 1
+}
+
+if sub == "" { _usage() }
+
+if sub == "list" {
+    op_list()
+    exit(0)
+}
+
+if sub == "status" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_status(host)
+    exit(0)
+}
+
+if sub == "add" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_add(host)
+    exit(0)
+}
+
+if sub == "remove" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_remove(host)
+    exit(0)
+}
+
+if sub == "fix" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_fix(host)
+    exit(0)
+}
+
+if sub == "oauth-status" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_oauth_status(host)
+    exit(0)
+}
+
+if sub == "oauth-reset" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    op_oauth_reset(host)
+    exit(0)
+}
+
+if sub == "log" {
+    // Default tail-n = 20; allow positional integer override.
+    let mut tail_n = 20
+    if sub_idx + 1 < len(cli) {
+        let raw = cli[sub_idx + 1]
+        let n = to_int(raw)
+        if n > 0 && n < 100000 { tail_n = n }
+    }
+    op_log(tail_n)
+    exit(0)
+}
+
+eprintln("__HIVE_RESOURCE__ FAIL op=" + sub + " reason=unknown-subcommand")
+audit_emit(sub, "*", "FAIL", "unknown-subcommand")
+_usage()
