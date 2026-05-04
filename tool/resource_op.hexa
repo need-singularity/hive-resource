@@ -27,7 +27,7 @@
 //   raw 169 surgical-edit-scope · raw 91 C3 honest disclosure
 //   raw 12 silent-error-ban · raw 65 idempotent · raw 173 deterministic
 //
-// @tool(slug="resource_op", desc="own 5 hive resource <op> CLI worker — list/status/add/remove/fix/oauth-status/oauth-reset host pool. Pool config ~/.hive/host_pool.hxc, hardcoded fallback. fix subcommand runs deterministic repair playbook (broken nexus shim reinstall + claude binary check + ssh setup hint + oauth slot health detail). oauth-status enumerates per-slot status (active|cooldown|limit-expired|oauth-revoked); oauth-reset removes stale .kick_limit_until markers older than threshold.")
+// @tool(slug="resource_op", desc="own 5 hive resource <op> CLI worker — list/status/add/remove/fix/oauth-status/oauth-reset/probe/sync/bootstrap/dispatch-check host pool. Pool config .resource SSOT (Stage B). fix runs deterministic repair playbook (nexus shim + claude bin + slot health). probe/sync/bootstrap/dispatch-check delegate to R-policy RM1/RM3/RM4 (2026-05-01 R7' dedup land).")
 // @sentinel(__HIVE_RESOURCE__ <PASS|FAIL> <op> [host] [details])
 // @usage(hexa run tool/resource_op.hexa list)
 // @usage(hexa run tool/resource_op.hexa status [host])
@@ -547,7 +547,7 @@ fn op_add(host: string) -> void {
 
     // Step 2: nexus shim health (auto-repair format-error idempotently)
     let nx_final = _ensure_nexus_shim(host)
-    println("# step 2/4: nexus shim — " + nx_final)
+    println("# step 2/5: nexus shim — " + nx_final)
     if nx_final == "format-error" {
         eprintln("#   → shim rewrite did not heal format-error.")
         eprintln("#   fix: ssh " + host + " 'ls -la ~/.hx/bin ~/.hx/packages/nexus/cli/run.hexa'")
@@ -560,7 +560,7 @@ fn op_add(host: string) -> void {
 
     // Step 3: claude binary (advisory — install is interactive)
     let cb = _ssh_claude_bin_status(host)
-    println("# step 3/4: claude binary — " + cb)
+    println("# step 3/5: claude binary — " + cb)
     if cb == "missing" {
         println("#   → claude binary missing; OAuth slot fallback unavailable.")
         println("#   fix: ssh " + host + " 'curl -fsSL https://claude.ai/install.sh | bash'")
@@ -568,10 +568,40 @@ fn op_add(host: string) -> void {
 
     // Step 4: OAuth slot count (advisory)
     let oa = _ssh_oauth_slots(host)
-    println("# step 4/4: oauth slots — count=" + oa)
+    println("# step 4/5: oauth slots — count=" + oa)
     if oa == "0" {
         println("#   → no ~/.claude-claude<N> dirs (kick will FAIL with all-claude-slots-exhausted)")
         println("#   fix: ssh " + host + " 'mkdir -p ~/.claude-claude1 && claude /login --config-dir ~/.claude-claude1'")
+    }
+
+    // Step 5: hexa wrapper compatibility — r39 follow-up #13 closure.
+    // Mac-side hexa wrapper (~/.hx/bin/hexa, dispatched via sshfs reverse-mount)
+    // 의 fallback path 가 $HOME/.hx/packages/hexa/hexa 을 호출 (line 60 default).
+    // 본 path 부재 시 spawn rc=127 silent fail. ssh 통한 idempotent symlink deploy.
+    // Result patterns: ok|deployed|missing-real-binary
+    // Step 5 deploy logic (idempotent):
+    //   (a) ensure ~/.hx/packages/hexa/hexa → ~/.hx/bin/hexa_real symlink (Mac wrapper fallback)
+    //   (b) ensure $LOCAL_HOME path resolvable on remote (sshfs reverse-mount or root
+    //       fallback symlink). sshfs 부재 host (root user) 에서는 $LOCAL_HOME → $HOME symlink 시도.
+    // raw 15 personal-path-leak-ban: Mac-side $HOME path 으로 composition (not literal).
+    //   local_home = env(HOME) on Mac (e.g. /Users/<operator>)
+    //   ssh remote sees identical absolute path via sshfs reverse-mount or root symlink.
+    //   No operator-name literal in source — works for any Mac user account.
+    let local_home = env("HOME")
+    let hx_cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes " + _shq(host) +
+        " 'set -e; if [ ! -x \"$HOME/.hx/bin/hexa_real\" ]; then echo missing-real-binary; exit 0; fi; " +
+        "mkdir -p \"$HOME/.hx/packages/hexa\" && ln -sf \"$HOME/.hx/bin/hexa_real\" \"$HOME/.hx/packages/hexa/hexa\"; " +
+        "if [ -e " + local_home + "/.hx/bin/hexa ]; then echo ok; exit 0; fi; " +
+        "if [ \"$(id -u)\" = 0 ]; then " +
+        "if [ ! -e " + local_home + " ]; then mkdir -p \"$(dirname " + local_home + ")\" && ln -sf \"$HOME\" " + local_home + "; " +
+        "elif [ -d " + local_home + " ] && [ ! -e " + local_home + "/.hx ]; then ln -sf \"$HOME/.hx\" " + local_home + "/.hx; fi; " +
+        "[ -e " + local_home + "/.hx/bin/hexa ] && echo deployed-symlink || echo missing-mac-wrapper; " +
+        "else echo missing-mac-path; fi' 2>/dev/null"
+    let hx_status = to_string(exec(hx_cmd)).trim()
+    println("# step 5/5: hexa wrapper compatibility — " + hx_status)
+    if hx_status == "missing-real-binary" {
+        println("#   → ~/.hx/bin/hexa_real missing on remote (hx package install required)")
+        println("#   fix: ssh " + host + " 'curl -fsSL <hx-installer-url> | bash'   # then re-run add")
     }
 
     // Stage D: invalidate cache so next kick re-probes with new pool state.
@@ -586,14 +616,14 @@ fn op_add(host: string) -> void {
         println("#              + commit. See docs/formats/resource.md for schema.")
     }
 
-    let healthy = nx_final == "ok"
+    let healthy = nx_final == "ok" && (hx_status == "ok" || hx_status == "deployed" || hx_status == "deployed-symlink")
     if healthy {
-        println("__HIVE_RESOURCE__ PASS add host=" + host + " state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
-        audit_emit("add", host, "PASS", "state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
+        println("__HIVE_RESOURCE__ PASS add host=" + host + " state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " hx_wrapper=" + hx_status + " in_pool=" + (if in_pool { "y" } else { "n" }))
+        audit_emit("add", host, "PASS", "state=bootstrapped nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " hx_wrapper=" + hx_status + " in_pool=" + (if in_pool { "y" } else { "n" }))
         exit(0)
     }
-    println("__HIVE_RESOURCE__ PASS add host=" + host + " state=partial nexus=" + nx_final + " claude=" + cb + " slots=" + oa)
-    audit_emit("add", host, "PARTIAL", "nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " in_pool=" + (if in_pool { "y" } else { "n" }))
+    println("__HIVE_RESOURCE__ PASS add host=" + host + " state=partial nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " hx_wrapper=" + hx_status)
+    audit_emit("add", host, "PARTIAL", "nexus=" + nx_final + " claude=" + cb + " slots=" + oa + " hx_wrapper=" + hx_status + " in_pool=" + (if in_pool { "y" } else { "n" }))
     exit(0)
 }
 
@@ -1008,6 +1038,847 @@ fn _selftest() -> void {
     exit(0)
 }
 
+// @pure_fn — find named flag value in cli array. own 8 dispatch helper.
+fn _flag_value_pre(cli_arr: array, flag: string) -> string {
+    let mut k = 0
+    while k < len(cli_arr) {
+        if cli_arr[k] == flag && (k + 1) < len(cli_arr) {
+            return cli_arr[k + 1]
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// ─── own 8 cross-host fix subcommands (patch / sync / exec) ─────────
+//
+// own 8 (cross-host-fix-via-hive-cli-only-mandate) primary canonical-core entry.
+// Replaces direct ssh '<host>' "cat > <file>" / scp / rsync / git push origin
+// remote-host patterns with single hive-resource entry. Every invocation emits
+// audit row to state/hive_resource_audit/audit.jsonl per raw 77 schema.
+//
+// raw 247 r45 separation:
+//   pure-fn:  _shq, _json_escape (already defined above)
+//   io-seam:  _ssh_write_file, _rsync_push_tool, _ssh_exec_capture (here)
+//   main:     op_patch / op_sync / op_exec (here)
+
+// @io_seam — write content to remote file via ssh heredoc. Returns rc.
+// content_b64 is base64-encoded to survive arbitrary bytes through shell.
+// raw 12 silent-error-ban + Block 5 (2026-05-01): inline argv mode is capped by
+// the *remote* bash ARG_MAX (~128KB on Linux) — for 156KB+ payloads use
+// _ssh_write_file_from_b64_path which streams via stdin (no argv ceiling).
+fn _ssh_write_file(host: string, remote_path: string, content_b64: string) -> int {
+    // base64 -d on remote → write to remote_path. Quote remote_path for safety.
+    let remote_cmd = "mkdir -p \"$(dirname " + _shq(remote_path) + ")\" && printf %s " + _shq(content_b64) + " | base64 -d > " + _shq(remote_path) + " && echo __SSH_WRITE_OK__"
+    let cmd = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes " + _shq(host) + " " + _shq(remote_cmd) + " 2>&1; echo __RC__$?"
+    let out = to_string(exec(cmd))
+    let i = out.find("__RC__")
+    if i < 0 { return 1 }
+    let rc_str = out.substring(i + 6, len(out)).trim()
+    return to_int(rc_str)
+}
+
+// @io_seam — write content to remote file via ssh stdin pipe. Returns rc.
+// b64_local_path is a local file containing base64 text. The b64 bytes are
+// streamed through the ssh stdin channel, bypassing argv ARG_MAX on BOTH ends.
+// Block 5 fix (2026-05-01) — own 8 large-payload (>128KB) cross-host channel.
+fn _ssh_write_file_from_b64_path(host: string, remote_path: string, b64_local_path: string) -> int {
+    // raw 12 silent-error-ban: explicit pipe + remote dirname mkdir; on success
+    // remote prints __SSH_WRITE_OK__; rc surfaced via __RC__$? trailer.
+    let remote_cmd = "mkdir -p \"$(dirname " + _shq(remote_path) + ")\" && base64 -d > " + _shq(remote_path) + " && echo __SSH_WRITE_OK__"
+    let cmd = "cat " + _shq(b64_local_path) + " | ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes " + _shq(host) + " " + _shq(remote_cmd) + " 2>&1; echo __RC__$?"
+    let out = to_string(exec(cmd))
+    let i = out.find("__RC__")
+    if i < 0 { return 1 }
+    let rc_str = out.substring(i + 6, len(out)).trim()
+    return to_int(rc_str)
+}
+
+// @io_seam — rsync local Mac canonical path → remote host path. Returns rc.
+fn _rsync_push_tool(host: string, local_path: string, remote_path: string) -> int {
+    // -a archive (mtime + perms preserved per raw 65 idempotent)
+    // -z compress
+    // --checksum (cryptographic verify, mtime not enough for drift detection)
+    let cmd = "rsync -az --checksum " + _shq(local_path) + " " + _shq(host) + ":" + _shq(remote_path) + " 2>&1; echo __RC__$?"
+    let out = to_string(exec(cmd))
+    let i = out.find("__RC__")
+    if i < 0 { return 1 }
+    let rc_str = out.substring(i + 6, len(out)).trim()
+    return to_int(rc_str)
+}
+
+// @io_seam — ssh exec a command on remote. Returns 2-array [stdout+stderr, rc].
+fn _ssh_exec_capture(host: string, remote_cmd: string) -> array {
+    let cmd = "ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes " + _shq(host) + " " + _shq(remote_cmd) + " 2>&1; echo __RC__$?"
+    let out = to_string(exec(cmd))
+    let i = out.find("__RC__")
+    if i < 0 { return [out, 1] }
+    let head = out.substring(0, i)
+    let rc_str = out.substring(i + 6, len(out)).trim()
+    return [head, to_int(rc_str)]
+}
+
+// op_patch <host> --tool <path> --content-b64 <heredoc>
+//   Writes given content (base64-encoded for safety) to remote <path> on <host>.
+//   own 8 primary entry — replaces ad-hoc ssh '<host>' "cat > <file>" patterns.
+//   Block 5 fix (2026-05-01): caller may supply --content-b64-file <path> via
+//   op_patch_from_b64_file() instead, which streams via ssh stdin and bypasses
+//   argv ARG_MAX (~128KB remote bash) for 156KB+ b64 payloads.
+fn op_patch(host: string, tool_path: string, content_b64: string) -> void {
+    if len(host) == 0 || len(tool_path) == 0 || len(content_b64) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL patch reason=missing-arg")
+        eprintln("usage: hive resource patch <host> --tool <path> --content-b64 <base64>")
+        eprintln("       hive resource patch <host> --tool <path> --content-b64-file <local-b64-path>")
+        eprintln("       (use --content-b64-file for >120KB payloads; bypasses remote ARG_MAX)")
+        audit_emit("patch", host, "FAIL", "missing-arg")
+        exit(4)
+    }
+    println("__HIVE_RESOURCE__ patch begin host=" + host + " tool=" + tool_path)
+    let rc = _ssh_write_file(host, tool_path, content_b64)
+    if rc != 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL patch host=" + host + " rc=" + to_string(rc))
+        audit_emit("patch", host, "FAIL", "ssh-write rc=" + to_string(rc) + " path=" + tool_path)
+        exit(1)
+    }
+    // Verify via remote byte count (raw 247 io-seam, simple cmp).
+    let chk = _ssh_exec_capture(host, "[ -f " + _shq(tool_path) + " ] && wc -c < " + _shq(tool_path) + " || echo ABSENT")
+    let chk_out = to_string(chk[0]).trim()
+    println("__HIVE_RESOURCE__ patch verify host=" + host + " bytes=" + chk_out)
+    audit_emit("patch", host, "PASS", "ssh-write rc=0 path=" + tool_path + " bytes=" + chk_out)
+    println("__HIVE_RESOURCE__ PASS patch host=" + host + " tool=" + tool_path)
+}
+
+// op_patch_from_b64_file <host> --tool <path> --content-b64-file <local-b64-path>
+//   Same semantics as op_patch but streams b64 via ssh stdin pipe — no argv
+//   bottleneck on either local or remote side. Block 5 fix (2026-05-01).
+fn op_patch_from_b64_file(host: string, tool_path: string, b64_local_path: string) -> void {
+    if len(host) == 0 || len(tool_path) == 0 || len(b64_local_path) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL patch reason=missing-arg")
+        eprintln("usage: hive resource patch <host> --tool <path> --content-b64-file <local-b64-path>")
+        audit_emit("patch", host, "FAIL", "missing-arg")
+        exit(4)
+    }
+    let exists = to_string(exec("[ -f " + _shq(b64_local_path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" {
+        eprintln("__HIVE_RESOURCE__ FAIL patch reason=content-b64-file-missing path=" + b64_local_path)
+        audit_emit("patch", host, "FAIL", "content-b64-file-missing path=" + b64_local_path)
+        exit(2)
+    }
+    let bytes_str = to_string(exec("wc -c < " + _shq(b64_local_path))).trim()
+    println("__HIVE_RESOURCE__ patch begin host=" + host + " tool=" + tool_path + " mode=b64-file b64-bytes=" + bytes_str)
+    let rc = _ssh_write_file_from_b64_path(host, tool_path, b64_local_path)
+    if rc != 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL patch host=" + host + " rc=" + to_string(rc))
+        audit_emit("patch", host, "FAIL", "ssh-write-stream rc=" + to_string(rc) + " path=" + tool_path + " b64-bytes=" + bytes_str)
+        exit(1)
+    }
+    let chk = _ssh_exec_capture(host, "[ -f " + _shq(tool_path) + " ] && wc -c < " + _shq(tool_path) + " || echo ABSENT")
+    let chk_out = to_string(chk[0]).trim()
+    println("__HIVE_RESOURCE__ patch verify host=" + host + " bytes=" + chk_out)
+    audit_emit("patch", host, "PASS", "ssh-write-stream rc=0 path=" + tool_path + " bytes=" + chk_out + " b64-bytes=" + bytes_str)
+    println("__HIVE_RESOURCE__ PASS patch host=" + host + " tool=" + tool_path)
+}
+
+// op_sync <host> --tool <path>
+//   rsync local Mac canonical $HIVE/<tool_path> → remote host:<HIVE>/<tool_path>.
+//   own 8 second entry — Mac canonical → host file sync, mtime+checksum based.
+fn op_sync(host: string, tool_path: string) -> void {
+    if len(host) == 0 || len(tool_path) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL sync reason=missing-arg")
+        eprintln("usage: hive resource sync <host> --tool <path>")
+        audit_emit("sync", host, "FAIL", "missing-arg")
+        exit(4)
+    }
+    let hive = to_string(exec("printf %s \"$HIVE\"")).trim()
+    if len(hive) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL sync reason=HIVE-env-unset")
+        audit_emit("sync", host, "FAIL", "HIVE-env-unset")
+        exit(2)
+    }
+    // Resolve local canonical path: $HIVE/<tool_path> if relative, else absolute.
+    let local_full = if tool_path.starts_with("/") { tool_path } else { hive + "/" + tool_path }
+    let local_exists = to_string(exec("[ -f " + _shq(local_full) + " ] && echo Y || echo N")).trim()
+    if local_exists != "Y" {
+        eprintln("__HIVE_RESOURCE__ FAIL sync reason=local-tool-missing path=" + local_full)
+        audit_emit("sync", host, "FAIL", "local-tool-missing path=" + local_full)
+        exit(2)
+    }
+    // Remote path: $HOME/core/hive/<tool_path> on host (mirrors Mac layout).
+    let remote_full = "core/hive/" + tool_path
+    println("__HIVE_RESOURCE__ sync begin host=" + host + " local=" + local_full + " remote=" + remote_full)
+    let rc = _rsync_push_tool(host, local_full, remote_full)
+    if rc != 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL sync host=" + host + " rc=" + to_string(rc))
+        audit_emit("sync", host, "FAIL", "rsync rc=" + to_string(rc) + " path=" + tool_path)
+        exit(1)
+    }
+    audit_emit("sync", host, "PASS", "rsync rc=0 path=" + tool_path)
+    println("__HIVE_RESOURCE__ PASS sync host=" + host + " tool=" + tool_path)
+}
+
+// op_exec <host> --command <cmd>
+//   Emergency cross-host exec. raw 91 honest C3: this is escape-hatch tool;
+//   every invocation forces audit row + emergency disclosure. own 8 falsifier
+//   F-OWN8-6: > 5 invocations / 30d means everyday-tool drift.
+fn op_exec(host: string, remote_cmd: string, c3_disclosure: string) -> void {
+    if len(host) == 0 || len(remote_cmd) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL exec reason=missing-arg")
+        eprintln("usage: hive resource exec <host> --command \"<cmd>\" --c3 \"<emergency-rationale>\"")
+        audit_emit("exec", host, "FAIL", "missing-arg")
+        exit(4)
+    }
+    if len(c3_disclosure) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL exec reason=missing-c3-disclosure")
+        eprintln("raw 91 honest C3: --c3 \"<reason this is emergency>\" required for exec subcmd")
+        audit_emit("exec", host, "FAIL", "missing-c3-disclosure")
+        exit(4)
+    }
+    println("__HIVE_RESOURCE__ exec begin host=" + host + " c3=" + c3_disclosure)
+    let res = _ssh_exec_capture(host, remote_cmd)
+    let out = to_string(res[0])
+    let rc = to_int(res[1])
+    print(out)
+    if rc != 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL exec host=" + host + " rc=" + to_string(rc))
+        audit_emit("exec", host, "FAIL", "ssh-exec rc=" + to_string(rc) + " cmd=" + remote_cmd + " c3=" + c3_disclosure)
+        exit(rc)
+    }
+    audit_emit("exec", host, "PASS", "ssh-exec rc=0 cmd=" + remote_cmd + " c3=" + c3_disclosure)
+    println("__HIVE_RESOURCE__ PASS exec host=" + host)
+}
+
+// ─── universal kind registry (resource.015 / 016 / 017, dispatch.002) ─
+//
+// Layered on top of the host-pool subcommands above. Discriminator:
+// `add|remove|list|verify|apply` second positional matches a kind slug
+// declared in spec/sync_registry.spec.yaml#kinds[] → route here. Otherwise
+// fall through to legacy host-pool semantics (`add <host>`, `remove <host>`,
+// `list` host pool table).
+//
+// Read SSOT: <hive-root>/spec/sync_registry.spec.yaml (resource.015 — only
+// THIS binary may read it; consumers go through `hive-resource list`).
+// Mutation SSOT: same file, but only via op_kind_add / op_kind_remove
+// (resource.016).
+// Handler exec: child process via `hexa run <hive-root>/handlers/<kind>.hexa`
+// (dispatch.002 — no shared module imports, no in-process calls).
+
+// @io_seam: locate <hive-root>. Env HIVE_ROOT first, else default
+// /Users/ghost/core/hive (single-operator dev environment).
+fn _hive_repo_root() -> string {
+    let env_root = to_string(exec("printf %s \"$HIVE_ROOT\"")).trim()
+    if len(env_root) > 0 { return env_root }
+    return "/Users/ghost/core/hive"
+}
+
+fn _sync_registry_path() -> string {
+    return _hive_repo_root() + "/spec/sync_registry.spec.yaml"
+}
+
+// Map slug → yaml section key (most slugs pluralize by suffix `s`, but a few
+// double the trailing consonant or use `-s` form per spec). Keep in sync
+// with sync_registry.spec.yaml section headers.
+fn _kind_section(kind: string) -> string {
+    if kind == "kind" { return "kinds" }
+    if kind == "repo" { return "repos" }
+    if kind == "hook" { return "hooks" }
+    if kind == "gate" { return "gates" }
+    if kind == "deploy-key" { return "deploy-keys" }
+    if kind == "path-patch" { return "path-patches" }
+    if kind == "env-export" { return "env-exports" }
+    if kind == "npm-global" { return "npm-globals" }
+    return ""
+}
+
+// kinds[] uses `slug:` as identity; every other section uses `name:`.
+fn _kind_id_field(kind: string) -> string {
+    if kind == "kind" { return "slug" }
+    return "name"
+}
+
+// @io_seam: read the kinds[] manifest from sync_registry.spec.yaml. Returns
+// array of kind slug strings. Empty on parse failure (caller emits sentinel).
+//
+// Implementation note: the AOT hexa runtime exposed via the bin/hive-resource
+// shim does not provide json_parse_safe(); we instead ask python3 to emit a
+// newline-separated slug list (one slug per line) which we read directly.
+fn _read_registered_kinds() -> array {
+    let path = _sync_registry_path()
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" { return [] }
+    let cmd = "python3 -c 'import yaml,sys" + "\n" +
+              "d = yaml.safe_load(open(sys.argv[1])) or {}" + "\n" +
+              "for k in (d.get(\"kinds\") or []):" + "\n" +
+              "    s = k.get(\"slug\") if isinstance(k, dict) else None" + "\n" +
+              "    if s:" + "\n" +
+              "        print(s)" + "\n" +
+              "' " + _shq(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let lines = out.split("\n")
+    let mut result = []
+    let mut i = 0
+    while i < len(lines) {
+        let s = lines[i].trim()
+        // Skip resolver banners + blank lines.
+        if len(s) > 0 && !s.starts_with("[GATE]") && !s.starts_with("#") && !s.starts_with("hexa-resolver:") {
+            result.push(s)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Accept the canonical slug ("repo") OR the section header ("repos") as a
+// kind reference. resource.015 read surface is forgiving on the noun form;
+// internal logic always normalizes to the slug via _normalize_kind().
+fn _normalize_kind(token: string) -> string {
+    if token == "kinds" { return "kind" }
+    if token == "repos" { return "repo" }
+    if token == "hooks" { return "hook" }
+    if token == "gates" { return "gate" }
+    if token == "deploy-keys" { return "deploy-key" }
+    if token == "path-patches" { return "path-patch" }
+    if token == "env-exports" { return "env-export" }
+    if token == "npm-globals" { return "npm-global" }
+    return token
+}
+
+fn _is_registered_kind(token: string) -> bool {
+    if len(token) == 0 { return false }
+    let canonical = _normalize_kind(token)
+    let kinds = _read_registered_kinds()
+    let mut i = 0
+    while i < len(kinds) {
+        if kinds[i] == canonical { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Parse `k=v` and `--key=value` extra args into [[k,v], ...] pairs. Skips
+// the subcommand and kind/name positionals; consumes everything else with
+// `=` separator. raw 91 honest C3: bare positional tokens (no `=`) ignored.
+fn _parse_kv_args(cli_arr: array, skip_count: int) -> array {
+    let mut out = []
+    let mut i = skip_count
+    while i < len(cli_arr) {
+        let tok = cli_arr[i]
+        let mut eat = tok
+        if eat.starts_with("--") { eat = eat.substring(2, len(eat)) }
+        let eq = eat.index_of("=")
+        if eq > 0 {
+            let k = eat.substring(0, eq)
+            let v = eat.substring(eq + 1, len(eat))
+            out.push([k, v])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// @io_seam: invoke embedded python3 yaml-section mutator. Op is "add" or
+// "remove". For "add", kvs is the pairs array. Returns [ok: bool, msg: str].
+//
+// Strategy: read full file via python; locate `^<section>:$` and the row
+// `^  - <id_field>: <name>$`; either replace its k:v block (idempotent
+// add) or delete it (remove). Comment lines + unrelated sections are
+// preserved byte-for-byte (line-level edit, no yaml dump).
+fn _yaml_mutate(op: string, kind: string, name: string, kvs: array) -> array {
+    let path = _sync_registry_path()
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" { return [false, "spec missing: " + path] }
+    let section = _kind_section(kind)
+    if len(section) == 0 { return [false, "kind has no section mapping: " + kind] }
+    let id_field = _kind_id_field(kind)
+
+    // Build the kvs payload as a tab-separated sequence so the python helper
+    // can split it cleanly. raw 12 silent-error-ban: empty kvs is legal for
+    // remove and for add-with-no-fields. Tab is safe because k=v values that
+    // legitimately need tabs are pathological for a yaml registry; the lint
+    // tier rejects them upstream.
+    let mut kv_blob = ""
+    let mut i = 0
+    while i < len(kvs) {
+        if i > 0 { kv_blob = kv_blob + "\t" }
+        kv_blob = kv_blob + kvs[i][0] + "=" + kvs[i][1]
+        i = i + 1
+    }
+
+    // Write the python helper as a temp script and invoke it. Embedding a
+    // multi-line python program via `python3 -c` is brittle with quoting;
+    // a tmp script keeps the program intact and survives multiple shell
+    // escape layers. raw 65 idempotent: tmp file path includes pid so
+    // concurrent invocations don't race.
+    let pid = to_string(exec("echo $$")).trim()
+    let tmp_py = "/tmp/hive_resource_yaml_mut_" + pid + ".py"
+    let py_src = _yaml_mutator_py_source()
+    write_file(tmp_py, py_src)
+    let cmd = "python3 " + _shq(tmp_py) + " " + _shq(path) + " " + _shq(op) + " " + _shq(section) + " " + _shq(id_field) + " " + _shq(name) + " " + _shq(kv_blob) + " 2>&1"
+    let out = to_string(exec(cmd))
+    let _rm = exec("rm -f " + _shq(tmp_py) + " 2>/dev/null")
+
+    // Strip resolver / gate banner lines so we only see the python helper's
+    // verdict line. The python program emits exactly ONE line on stdout:
+    // "OK <action>" on success, "ERR <reason>" on failure.
+    let raw_lines = out.split("\n")
+    let mut payload = ""
+    let mut li = 0
+    while li < len(raw_lines) {
+        let s = raw_lines[li].trim()
+        if len(s) > 0 && !s.starts_with("[GATE]") && !s.starts_with("hexa-resolver:") && !s.starts_with("# resolver:") {
+            payload = s  // last non-banner line wins
+        }
+        li = li + 1
+    }
+    if payload.starts_with("OK ") {
+        return [true, payload.substring(3, len(payload))]
+    }
+    return [false, payload]
+}
+
+// Embedded python3 yaml-section mutator. Operates at the line level so
+// comments + unrelated sections + blank lines are preserved byte-identical.
+//
+// Algorithm:
+//   1. Read file → list of lines.
+//   2. Find section header line `^<section>:$`.
+//   3. Within section body (until next top-level token or EOF), enumerate
+//      list rows. A row starts at `^  - <id_field>: <id>$` and continues
+//      until the next row header or section end.
+//   4. ADD: if row exists → replace its body lines with new k:v lines (kvs);
+//          if absent → append a fresh row at the end of the section body.
+//   5. REMOVE: if row exists → delete its lines; if absent → no-op.
+//
+// raw 65 idempotent: round-trip add(name, k=v) → remove(name) yields
+// byte-identical output. add(name, k=v) twice with the same kvs is a no-op.
+fn _yaml_mutator_py_source() -> string {
+    return "#!/usr/bin/env python3\n" +
+"import sys, os\n" +
+"\n" +
+"def main():\n" +
+"    path, op, section, id_field, name, kv_blob = sys.argv[1:7]\n" +
+"    with open(path, 'r') as f:\n" +
+"        lines = f.read().split('\\n')\n" +
+"\n" +
+"    # Parse kv_blob (tab-delimited k=v pairs).\n" +
+"    kvs = []\n" +
+"    if kv_blob:\n" +
+"        for tok in kv_blob.split('\\t'):\n" +
+"            if '=' in tok:\n" +
+"                k, _, v = tok.partition('=')\n" +
+"                kvs.append((k, v))\n" +
+"\n" +
+"    # Locate section header line (first occurrence of '^<section>:$').\n" +
+"    sect_hdr_idx = None\n" +
+"    for i, ln in enumerate(lines):\n" +
+"        if ln.rstrip() == section + ':':\n" +
+"            sect_hdr_idx = i\n" +
+"            break\n" +
+"    if sect_hdr_idx is None:\n" +
+"        # Section absent. For add: create at EOF. For remove: no-op.\n" +
+"        if op == 'remove':\n" +
+"            print('OK noop-section-absent')\n" +
+"            return 0\n" +
+"        # Append a fresh section to EOF (skip if last line is blank).\n" +
+"        if lines and lines[-1] != '':\n" +
+"            lines.append('')\n" +
+"        lines.append(section + ':')\n" +
+"        body = ['  - ' + id_field + ': ' + name]\n" +
+"        for k, v in kvs:\n" +
+"            body.append('    ' + k + ': ' + v)\n" +
+"        lines.extend(body)\n" +
+"        with open(path, 'w') as f:\n" +
+"            f.write('\\n'.join(lines))\n" +
+"        print('OK appended-new-section')\n" +
+"        return 0\n" +
+"\n" +
+"    # Find body span: from sect_hdr_idx+1 until next non-indented non-blank\n" +
+"    # non-comment line that looks like a top-level yaml key.\n" +
+"    body_start = sect_hdr_idx + 1\n" +
+"    body_end = len(lines)\n" +
+"    for j in range(body_start, len(lines)):\n" +
+"        s = lines[j]\n" +
+"        if not s:\n" +
+"            continue\n" +
+"        if s.startswith('#'):\n" +
+"            continue\n" +
+"        if s.startswith(' ') or s.startswith('\\t'):\n" +
+"            continue\n" +
+"        if s.startswith('---'):\n" +
+"            body_end = j\n" +
+"            break\n" +
+"        # Top-level key at column 0 → next section starts here.\n" +
+"        if ':' in s and not s.lstrip().startswith('-'):\n" +
+"            body_end = j\n" +
+"            break\n" +
+"\n" +
+"    # Enumerate rows in the body span. Row header: line starting with\n" +
+"    # '  - <id_field>: '. Row spans until next row header or body_end.\n" +
+"    row_hdr_prefix = '  - ' + id_field + ': '\n" +
+"    rows = []  # list of (start_idx, end_idx, id_value)\n" +
+"    cur = None\n" +
+"    for j in range(body_start, body_end):\n" +
+"        s = lines[j]\n" +
+"        if s.startswith(row_hdr_prefix):\n" +
+"            if cur is not None:\n" +
+"                rows.append((cur[0], j, cur[1]))\n" +
+"            id_val = s[len(row_hdr_prefix):].strip()\n" +
+"            # Strip optional yaml quotes.\n" +
+"            if (id_val.startswith('\"') and id_val.endswith('\"')) or (id_val.startswith(\"'\") and id_val.endswith(\"'\")):\n" +
+"                id_val = id_val[1:-1]\n" +
+"            cur = (j, id_val)\n" +
+"        elif s.startswith('  - '):\n" +
+"            # A row header for a different id_field — close current row.\n" +
+"            if cur is not None:\n" +
+"                rows.append((cur[0], j, cur[1]))\n" +
+"                cur = None\n" +
+"    if cur is not None:\n" +
+"        rows.append((cur[0], body_end, cur[1]))\n" +
+"\n" +
+"    # Trim trailing blank lines from each row's end so re-insertion is clean.\n" +
+"    def trim_row_end(rs, re):\n" +
+"        e = re\n" +
+"        while e > rs + 1 and lines[e-1] == '':\n" +
+"            e -= 1\n" +
+"        return e\n" +
+"\n" +
+"    target = None\n" +
+"    for (rs, re, rid) in rows:\n" +
+"        if rid == name:\n" +
+"            target = (rs, re)\n" +
+"            break\n" +
+"\n" +
+"    if op == 'remove':\n" +
+"        if target is None:\n" +
+"            print('OK noop-row-absent')\n" +
+"            return 0\n" +
+"        rs, re = target\n" +
+"        re_trim = trim_row_end(rs, re)\n" +
+"        del lines[rs:re_trim]\n" +
+"        with open(path, 'w') as f:\n" +
+"            f.write('\\n'.join(lines))\n" +
+"        print('OK removed')\n" +
+"        return 0\n" +
+"\n" +
+"    if op == 'add':\n" +
+"        # Build new row block.\n" +
+"        new_block = ['  - ' + id_field + ': ' + name]\n" +
+"        for k, v in kvs:\n" +
+"            new_block.append('    ' + k + ': ' + v)\n" +
+"        if target is not None:\n" +
+"            rs, re = target\n" +
+"            re_trim = trim_row_end(rs, re)\n" +
+"            old_block = lines[rs:re_trim]\n" +
+"            if old_block == new_block:\n" +
+"                print('OK noop-idempotent')\n" +
+"                return 0\n" +
+"            lines[rs:re_trim] = new_block\n" +
+"            with open(path, 'w') as f:\n" +
+"                f.write('\\n'.join(lines))\n" +
+"            print('OK updated')\n" +
+"            return 0\n" +
+"        # Insert at end of body (before body_end). Drop trailing blanks first.\n" +
+"        ins_at = body_end\n" +
+"        while ins_at > body_start and lines[ins_at-1] == '':\n" +
+"            ins_at -= 1\n" +
+"        # Rows in the canonical spec are NOT separated by blank lines (they\n" +
+"        # are consecutive '- name:' blocks). Insert directly so removal can\n" +
+"        # round-trip byte-identical.\n" +
+"        lines[ins_at:ins_at] = new_block\n" +
+"        with open(path, 'w') as f:\n" +
+"            f.write('\\n'.join(lines))\n" +
+"        print('OK appended')\n" +
+"        return 0\n" +
+"\n" +
+"    print('ERR unknown-op:' + op)\n" +
+"    return 2\n" +
+"\n" +
+"sys.exit(main())\n"
+}
+
+// @io_seam: list rows of a kind, emitted as `<kind>:<name>:<k=v,k=v>` lines.
+// `kind == \"\"` means \"every kind\".
+fn op_kind_list(kind: string) -> void {
+    let path = _sync_registry_path()
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" {
+        eprintln("__HIVE_RESOURCE__ FAIL list reason=spec-missing path=" + path)
+        audit_emit("list-kind", "*", "FAIL", "spec-missing")
+        exit(1)
+    }
+
+    // Figure out the section list to dump.
+    let mut sections = []
+    if len(kind) == 0 {
+        // All sections — drive from kinds[] manifest so we stay aligned.
+        let registered = _read_registered_kinds()
+        let mut i = 0
+        while i < len(registered) {
+            let s = _kind_section(registered[i])
+            if len(s) > 0 { sections.push([registered[i], s]) }
+            i = i + 1
+        }
+    } else {
+        let normalized = _normalize_kind(kind)
+        let s = _kind_section(normalized)
+        if len(s) == 0 {
+            eprintln("__HIVE_RESOURCE__ FAIL list kind=" + kind + " reason=unknown-kind")
+            eprintln("known kinds: " + _join(_read_registered_kinds(), ", "))
+            audit_emit("list-kind", kind, "FAIL", "unknown-kind")
+            exit(3)
+        }
+        sections.push([normalized, s])
+    }
+
+    // Emit JSON-then-flatten via python3 — simpler than line-level enum.
+    let pid = to_string(exec("echo $$")).trim()
+    let tmp_py = "/tmp/hive_resource_yaml_list_" + pid + ".py"
+    let py_src = "#!/usr/bin/env python3\n" +
+"import yaml, sys\n" +
+"path = sys.argv[1]\n" +
+"want = sys.argv[2:]\n" +
+"# BaseLoader preserves every scalar as a str, so yaml 1.1 boolean aliases\n" +
+"# like `on:` stay as the literal string 'on' instead of becoming True —\n" +
+"# the registry uses on: push for hook triggers and that round-trip should\n" +
+"# survive list output.\n" +
+"d = yaml.load(open(path), Loader=yaml.BaseLoader) or {}\n" +
+"for spec in want:\n" +
+"    kind, section = spec.split('|', 1)\n" +
+"    rows = d.get(section, []) or []\n" +
+"    id_field = 'slug' if kind == 'kind' else 'name'\n" +
+"    for row in rows:\n" +
+"        if not isinstance(row, dict):\n" +
+"            continue\n" +
+"        rid = row.get(id_field, '?')\n" +
+"        kvs = []\n" +
+"        for k, v in row.items():\n" +
+"            if k == id_field:\n" +
+"                continue\n" +
+"            if isinstance(v, (list, dict)):\n" +
+"                # Compact one-line repr; drop newlines from descriptions.\n" +
+"                vs = repr(v).replace('\\n', ' ')\n" +
+"            else:\n" +
+"                # Coerce booleans/ints/None into str — yaml spec keys like\n" +
+"                # `on: push` get parsed as True (yaml 1.1 boolean alias).\n" +
+"                vs = str(v).replace('\\n', ' ')\n" +
+"            kvs.append(str(k) + '=' + vs)\n" +
+"        print(str(kind) + ':' + str(rid) + ':' + ','.join(kvs))\n"
+    write_file(tmp_py, py_src)
+
+    let mut args = ""
+    let mut k = 0
+    while k < len(sections) {
+        args = args + " " + _shq(sections[k][0] + "|" + sections[k][1])
+        k = k + 1
+    }
+    let cmd = "python3 " + _shq(tmp_py) + " " + _shq(path) + args + " 2>/dev/null"
+    let raw_out = to_string(exec(cmd))
+    let _rm = exec("rm -f " + _shq(tmp_py) + " 2>/dev/null")
+
+    // Strip resolver / gate banner lines so list output is machine-readable.
+    let raw_lines = raw_out.split("\n")
+    let mut clean_lines = []
+    let mut ri = 0
+    while ri < len(raw_lines) {
+        let s = raw_lines[ri]
+        let st = s.trim()
+        if len(st) > 0 && !st.starts_with("[GATE]") && !st.starts_with("hexa-resolver:") {
+            clean_lines.push(s)
+        }
+        ri = ri + 1
+    }
+    let mut out_text = ""
+    let mut ci = 0
+    while ci < len(clean_lines) {
+        if ci > 0 { out_text = out_text + "\n" }
+        out_text = out_text + clean_lines[ci]
+        ci = ci + 1
+    }
+    if len(out_text) > 0 { println(out_text) }
+    let count = len(clean_lines)
+    let scope_label = if len(kind) == 0 { "*" } else { kind }
+    println("__HIVE_RESOURCE__ PASS list kind=" + scope_label + " rows=" + to_string(count))
+    audit_emit("list-kind", scope_label, "PASS", "rows=" + to_string(count))
+}
+
+fn op_kind_add(kind: string, name: string, kvs: array) -> void {
+    if len(name) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL add kind=" + kind + " reason=missing-name")
+        eprintln("usage: hive resource add <kind> <name> [k=v ...]")
+        audit_emit("add-kind", kind, "FAIL", "missing-name")
+        exit(4)
+    }
+    if len(_kind_section(kind)) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL add kind=" + kind + " reason=unknown-kind")
+        eprintln("known kinds: " + _join(_read_registered_kinds(), ", "))
+        audit_emit("add-kind", kind, "FAIL", "unknown-kind")
+        exit(3)
+    }
+    let res = _yaml_mutate("add", kind, name, kvs)
+    if !res[0] {
+        eprintln("__HIVE_RESOURCE__ FAIL add kind=" + kind + " name=" + name + " reason=" + to_string(res[1]))
+        audit_emit("add-kind", kind + ":" + name, "FAIL", to_string(res[1]))
+        exit(1)
+    }
+    println("__HIVE_RESOURCE__ PASS add kind=" + kind + " name=" + name + " action=" + to_string(res[1]))
+    audit_emit("add-kind", kind + ":" + name, "PASS", "action=" + to_string(res[1]) + " kvs=" + to_string(len(kvs)))
+}
+
+fn op_kind_remove(kind: string, name: string) -> void {
+    if len(name) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL remove kind=" + kind + " reason=missing-name")
+        eprintln("usage: hive resource remove <kind> <name>")
+        audit_emit("remove-kind", kind, "FAIL", "missing-name")
+        exit(4)
+    }
+    if len(_kind_section(kind)) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL remove kind=" + kind + " reason=unknown-kind")
+        eprintln("known kinds: " + _join(_read_registered_kinds(), ", "))
+        audit_emit("remove-kind", kind, "FAIL", "unknown-kind")
+        exit(3)
+    }
+    let res = _yaml_mutate("remove", kind, name, [])
+    if !res[0] {
+        eprintln("__HIVE_RESOURCE__ FAIL remove kind=" + kind + " name=" + name + " reason=" + to_string(res[1]))
+        audit_emit("remove-kind", kind + ":" + name, "FAIL", to_string(res[1]))
+        exit(1)
+    }
+    println("__HIVE_RESOURCE__ PASS remove kind=" + kind + " name=" + name + " action=" + to_string(res[1]))
+    audit_emit("remove-kind", kind + ":" + name, "PASS", "action=" + to_string(res[1]))
+}
+
+// Locate a kind handler script. Returns path or empty string if missing.
+fn _kind_handler_path(kind: string) -> string {
+    let p = _hive_repo_root() + "/handlers/" + kind + ".hexa"
+    let exists = to_string(exec("[ -f " + _shq(p) + " ] && echo Y || echo N")).trim()
+    if exists == "Y" { return p }
+    return ""
+}
+
+// dispatch.002: run handler in a child hexa process (no shared imports). The
+// handler is invoked once per row in the section. Verb is "--verify" or
+// "--apply". Aggregates exit codes (1 if any row fails).
+fn op_kind_handler_iter(kind: string, verb: string) -> void {
+    let path = _sync_registry_path()
+    let exists = to_string(exec("[ -f " + _shq(path) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" {
+        eprintln("__HIVE_RESOURCE__ FAIL " + verb + " reason=spec-missing")
+        audit_emit(verb, "*", "FAIL", "spec-missing")
+        exit(1)
+    }
+
+    // Determine kinds in scope.
+    let mut scopes = []
+    if len(kind) == 0 {
+        let regs = _read_registered_kinds()
+        let mut i = 0
+        while i < len(regs) {
+            scopes.push(regs[i])
+            i = i + 1
+        }
+    } else {
+        let normalized = _normalize_kind(kind)
+        if len(_kind_section(normalized)) == 0 {
+            eprintln("__HIVE_RESOURCE__ FAIL " + verb + " kind=" + kind + " reason=unknown-kind")
+            audit_emit(verb, kind, "FAIL", "unknown-kind")
+            exit(3)
+        }
+        scopes.push(normalized)
+    }
+
+    // Use python3 to enumerate row identifiers per section; then exec handler
+    // child-process per row.
+    let pid = to_string(exec("echo $$")).trim()
+    let tmp_py = "/tmp/hive_resource_yaml_ids_" + pid + ".py"
+    let py_src = "#!/usr/bin/env python3\n" +
+"import yaml, sys\n" +
+"path = sys.argv[1]\n" +
+"section = sys.argv[2]\n" +
+"id_field = sys.argv[3]\n" +
+"# BaseLoader keeps scalars as str so id values are emitted byte-identical\n" +
+"# to what the user supplied via `add <kind> <name>`.\n" +
+"d = yaml.load(open(path), Loader=yaml.BaseLoader) or {}\n" +
+"for row in (d.get(section) or []):\n" +
+"    if isinstance(row, dict) and row.get(id_field):\n" +
+"        print(row[id_field])\n"
+    write_file(tmp_py, py_src)
+
+    let mut total = 0
+    let mut failed = 0
+    let mut missing_handlers = 0
+    let mut s_i = 0
+    while s_i < len(scopes) {
+        let k = scopes[s_i]
+        let section = _kind_section(k)
+        let id_field = _kind_id_field(k)
+        let cmd = "python3 " + _shq(tmp_py) + " " + _shq(path) + " " + _shq(section) + " " + _shq(id_field) + " 2>/dev/null"
+        let raw = to_string(exec(cmd))
+        let raw_split = raw.split("\n")
+        let mut names = []
+        let mut nx = 0
+        while nx < len(raw_split) {
+            let s = raw_split[nx].trim()
+            if len(s) > 0 && !s.starts_with("[GATE]") && !s.starts_with("hexa-resolver:") && !s.starts_with("# resolver:") {
+                names.push(s)
+            }
+            nx = nx + 1
+        }
+
+        // Resolve handler once per kind.
+        let handler = _kind_handler_path(k)
+        if len(handler) == 0 {
+            // resource.017: emit kind-handler-missing sentinel + exit 4.
+            eprintln("__HIVE_RESOURCE__ status=kind-handler-missing kind=" + k)
+            eprintln("# kind handler not registered: " + _hive_repo_root() + "/handlers/" + k + ".hexa")
+            audit_emit(verb, k, "FAIL", "kind-handler-missing")
+            missing_handlers = missing_handlers + 1
+            s_i = s_i + 1
+            continue
+        }
+
+        let mut n_i = 0
+        while n_i < len(names) {
+            let name = names[n_i]
+            if len(name) > 0 {
+                total = total + 1
+                let inner = "hexa run " + _shq(handler) + " --" + verb + " --name=" + _shq(name) + " 2>&1; echo __RC__$?"
+                let out = to_string(exec(inner))
+                let idx = out.find("__RC__")
+                let mut rc = 1
+                let mut head = out
+                if idx >= 0 {
+                    head = out.substring(0, idx)
+                    rc = to_int(out.substring(idx + 6, len(out)).trim())
+                }
+                print(head)
+                if rc != 0 {
+                    failed = failed + 1
+                    audit_emit(verb, k + ":" + name, "FAIL", "rc=" + to_string(rc))
+                } else {
+                    audit_emit(verb, k + ":" + name, "PASS", "rc=0")
+                }
+            }
+            n_i = n_i + 1
+        }
+        s_i = s_i + 1
+    }
+    let _rm = exec("rm -f " + _shq(tmp_py) + " 2>/dev/null")
+
+    let scope_label = if len(kind) == 0 { "*" } else { kind }
+    println("__HIVE_RESOURCE__ summary " + verb + " kind=" + scope_label + " total=" + to_string(total) + " failed=" + to_string(failed) + " missing-handlers=" + to_string(missing_handlers))
+    // Note: hexa AOT runtime's exit() inside `void` functions does not always
+    // propagate to shell $? (pre-existing quirk shared with op_oauth_status,
+    // op_oauth_reset, etc). The sentinel + summary line on stdout/stderr remain
+    // the canonical machine-readable verdict; consumers should parse those
+    // rather than relying on $?.
+    if failed > 0 {
+        exit(1)
+    }
+    if missing_handlers > 0 {
+        exit(4)
+    }
+    exit(0)
+}
+
 // ─── usage ────────────────────────────────────────────────────────
 
 fn _usage() -> void {
@@ -1016,13 +1887,29 @@ fn _usage() -> void {
     println("")
     println("subcommands:")
     println("  list                        show pool with reachable + load + mem")
+    println("  list <kind>                 dump rows for a kind from sync_registry.spec.yaml")
+    println("  list kinds                  enumerate registered kinds (resource.017)")
     println("  status [host]               detailed health (ssh + nexus + claude + slots)")
     println("  add <host>                  probe + append to pool config")
     println("  remove <host>               unregister from pool config")
+    println("  add <kind> <name> [k=v ..]  register a row in sync_registry.spec.yaml (resource.016)")
+    println("  remove <kind> <name>        delete a row from sync_registry.spec.yaml")
+    println("  verify [<kind>]             child-exec each handler with --verify (dispatch.002)")
+    println("  apply  [<kind>]             child-exec each handler with --apply  (dispatch.002)")
     println("  fix <host>                  heuristic repair playbook (now incl. oauth slot health detail)")
     println("  oauth-status <host>         enumerate per-slot OAuth status (active|cooldown|limit-expired|revoked)")
     println("  oauth-reset <host>          remove stale .kick_limit_until markers (mmin > $HIVE_OAUTH_RESET_MMIN, default 60)")
     println("  log [tail-n]                tail audit ledger (default 20 entries)")
+    println("  probe <host>                R-policy capability probe (RM1, zero-hardcode GPU/CPU/ssh/mem)")
+    println("  sync <host> --tool <path>   own 8 — rsync local Mac canonical → host (mtime+checksum)")
+    println("  bootstrap <host>            R-policy zero-touch bootstrap (RM4: 9-step playbook)")
+    println("  dispatch-check <host>       R-policy backpressure check (RM3: 5-layer decision tree)")
+    println("  patch <host> --tool <path> --content-b64 <b64>")
+    println("                              own 8 — Mac canonical → host file via ssh + base64 heredoc")
+    println("  patch <host> --tool <path> --content-b64-file <local-b64-path>")
+    println("                              own 8 — same as above; reads b64 from file (>156KB safe; bypass ARG_MAX)")
+    println("  exec <host> --command <cmd> --c3 <rationale>")
+    println("                              own 8 — emergency cross-host exec (raw 91 C3 forced)")
     println("  --selftest                  run selftest")
     println("")
     println("config: ~/.hive/host_pool.hxc")
@@ -1041,16 +1928,23 @@ fn _usage() -> void {
 let raw_cli = args()
 let mut cli = []
 let mut s_i = 0
+let mut script_path_stripped = false
 // @triad: atomize
+// own 8 fix (2026-05-01): only strip the FIRST `.hexa` token (entry script
+// path); subsequent `.hexa` tokens are user-supplied flag values (e.g.
+// `--tool /path/to/foo.hexa`) and MUST be preserved. Prior filter dropped
+// every `.hexa` arg, breaking `hive resource sync <host> --tool *.hexa`.
 while s_i < len(raw_cli) {
     let a = raw_cli[s_i]
-    let is_exe_path = a.contains(".hexa-cache")
-                   || a.contains("hexa_interp")
-                   || a.contains("hexa_real")
-                   || a.ends_with("/hexa")
-                   || a.ends_with(".hexa")
+    let is_interp = a.contains(".hexa-cache")
+                 || a.contains("hexa_interp")
+                 || a.contains("hexa_real")
+                 || a.ends_with("/hexa")
+    let is_script = a.ends_with(".hexa") && !script_path_stripped
     let is_run_glue = a == "run"
-    if !is_exe_path && !is_run_glue {
+    let skip = is_interp || is_script || is_run_glue
+    if is_script { script_path_stripped = true }
+    if !skip {
         cli.push(a)
     }
     s_i = s_i + 1
@@ -1076,9 +1970,55 @@ while ai < len(cli) {
 
 if sub == "" { _usage() }
 
+// Universal-kind dispatch: the second positional after `add|remove|list|verify|apply`
+// is checked against the kinds[] manifest in spec/sync_registry.spec.yaml. If it
+// matches, route to the new kind flow; else fall through to legacy host-pool
+// semantics (resource.015 / 016 / 017, dispatch.002).
+fn _second_positional(cli_arr: array, sub_pos: int) -> string {
+    let mut k = sub_pos + 1
+    while k < len(cli_arr) {
+        let a = cli_arr[k]
+        if !a.starts_with("--") { return a }
+        k = k + 1
+    }
+    return ""
+}
+
+fn _third_positional(cli_arr: array, sub_pos: int) -> string {
+    let mut found = 0
+    let mut k = sub_pos + 1
+    while k < len(cli_arr) {
+        let a = cli_arr[k]
+        if !a.starts_with("--") {
+            found = found + 1
+            if found == 2 { return a }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
 if sub == "list" {
+    let p2 = _second_positional(cli, sub_idx)
+    if len(p2) > 0 && _is_registered_kind(p2) {
+        op_kind_list(_normalize_kind(p2))
+        exit(0)
+    }
     op_list()
     exit(0)
+}
+
+if sub == "verify" {
+    let p2 = _second_positional(cli, sub_idx)
+    let kind = if len(p2) > 0 { _normalize_kind(p2) } else { "" }
+    // op_kind_handler_iter terminates the process on every branch (exit 0/1/4).
+    op_kind_handler_iter(kind, "verify")
+}
+
+if sub == "apply" {
+    let p2 = _second_positional(cli, sub_idx)
+    let kind = if len(p2) > 0 { _normalize_kind(p2) } else { "" }
+    op_kind_handler_iter(kind, "apply")
 }
 
 if sub == "status" {
@@ -1089,6 +2029,27 @@ if sub == "status" {
 }
 
 if sub == "add" {
+    let p2 = _second_positional(cli, sub_idx)
+    if len(p2) > 0 && _is_registered_kind(p2) {
+        let kind = _normalize_kind(p2)
+        let name = _third_positional(cli, sub_idx)
+        // kvs: scan all tokens after sub_idx, skip the kind+name positionals.
+        let mut tail = []
+        let mut t_i = sub_idx + 1
+        let mut pos_seen = 0
+        while t_i < len(cli) {
+            let a = cli[t_i]
+            if !a.starts_with("--") {
+                pos_seen = pos_seen + 1
+                if pos_seen <= 2 { t_i = t_i + 1; continue }
+            }
+            tail.push(a)
+            t_i = t_i + 1
+        }
+        let kvs = _parse_kv_args(tail, 0)
+        op_kind_add(kind, name, kvs)
+        exit(0)
+    }
     let mut host = ""
     if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
     op_add(host)
@@ -1096,6 +2057,13 @@ if sub == "add" {
 }
 
 if sub == "remove" {
+    let p2 = _second_positional(cli, sub_idx)
+    if len(p2) > 0 && _is_registered_kind(p2) {
+        let kind = _normalize_kind(p2)
+        let name = _third_positional(cli, sub_idx)
+        op_kind_remove(kind, name)
+        exit(0)
+    }
     let mut host = ""
     if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
     op_remove(host)
@@ -1132,6 +2100,123 @@ if sub == "log" {
         if n > 0 && n < 100000 { tail_n = n }
     }
     op_log(tail_n)
+    exit(0)
+}
+
+// ─── R7' R-policy subcommand wiring (2026-05-01 dedup land) ──────────
+// Thin proxy to RM1..RM4 + M9. raw 91 honest C3: design-tier; live probe
+// gated by HEXA_DRY_RUN=0 (default 1 / mock).
+fn _rpolicy_proxy(slug: string, verb: string, host: string) -> void {
+    let hive = to_string(exec("printf %s \"$HIVE\"")).trim()
+    if len(hive) == 0 {
+        eprintln("__HIVE_RESOURCE__ FAIL " + verb + " reason=HIVE-env-unset")
+        audit_emit(verb, host, "FAIL", "HIVE-env-unset")
+        exit(2)
+    }
+    let tool = hive + "/tool/" + slug + ".hexa"
+    let exists = to_string(exec("[ -f " + _shq(tool) + " ] && echo Y || echo N")).trim()
+    if exists != "Y" {
+        eprintln("__HIVE_RESOURCE__ FAIL " + verb + " reason=tool-missing path=" + tool)
+        audit_emit(verb, host, "FAIL", "tool-missing")
+        exit(2)
+    }
+    // R-policy CLI verbs map: probe / limit / dispatch-check / add (bootstrap).
+    let inner_verb = if verb == "bootstrap" { "add" } else if verb == "sync" { "probe" } else { verb }
+    let cmd = "hexa run " + _shq(tool) + " " + inner_verb + " " + _shq(host) + " 2>&1"
+    let out = to_string(exec(cmd))
+    print(out)
+    audit_emit(verb, host, "PASS", "delegated to=" + slug + " inner=" + inner_verb)
+    exit(0)
+}
+
+if sub == "probe" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL probe reason=missing-host-arg")
+        eprintln("usage: hive resource probe <host>")
+        exit(4)
+    }
+    _rpolicy_proxy("resource_capability_probe", "probe", host)
+}
+
+if sub == "sync" {
+    // own 8 sync mode (with --tool flag) takes precedence over R-policy sync proxy
+    // (which is host-level capability cache refresh, no --tool argument).
+    let has_tool_flag = _flag_value_pre(cli, "--tool") != ""
+    if has_tool_flag {
+        let mut host = ""
+        if sub_idx + 1 < len(cli) {
+            let nxt = cli[sub_idx + 1]
+            if !nxt.starts_with("--") { host = nxt }
+        }
+        let tool_path = _flag_value_pre(cli, "--tool")
+        op_sync(host, tool_path)
+        exit(0)
+    }
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL sync reason=missing-host-arg")
+        eprintln("usage: hive resource sync <host>                 (R-policy capability sync)")
+        eprintln("       hive resource sync <host> --tool <path>   (own 8 file sync)")
+        exit(4)
+    }
+    _rpolicy_proxy("resource_capability_probe", "sync", host)
+}
+
+if sub == "bootstrap" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    if host == "" {
+        eprintln("__HIVE_RESOURCE__ FAIL bootstrap reason=missing-host-arg")
+        eprintln("usage: hive resource bootstrap <host>")
+        exit(4)
+    }
+    _rpolicy_proxy("resource_zero_touch_bootstrap", "bootstrap", host)
+}
+
+if sub == "dispatch-check" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) { host = cli[sub_idx + 1] }
+    if host == "" { host = "local" }
+    _rpolicy_proxy("resource_backpressure_scheduler", "dispatch-check", host)
+}
+
+// ─── own 8 patch / exec dispatch ───────────────────────────
+// (sync mode 은 위 sync block 에서 --tool flag 분기로 처리)
+// Parse --tool / --content-b64 / --command / --c3 named flags via _flag_value_pre.
+
+if sub == "patch" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) {
+        let nxt = cli[sub_idx + 1]
+        if !nxt.starts_with("--") { host = nxt }
+    }
+    let tool_path = _flag_value_pre(cli, "--tool")
+    // own 8 payload source (raw 12 silent-error-ban: explicit dispatch, never
+    // silent fallback). Block 5 (2026-05-01): --content-b64-file <path>
+    // streams via ssh stdin to bypass remote-bash ARG_MAX for 128KB+ payloads.
+    // Backwards-compat: --content-b64 <inline> still works for small files.
+    let content_b64_file = _flag_value_pre(cli, "--content-b64-file")
+    if len(content_b64_file) > 0 {
+        op_patch_from_b64_file(host, tool_path, content_b64_file)
+    } else {
+        let content_b64 = _flag_value_pre(cli, "--content-b64")
+        op_patch(host, tool_path, content_b64)
+    }
+    exit(0)
+}
+
+if sub == "exec" {
+    let mut host = ""
+    if sub_idx + 1 < len(cli) {
+        let nxt = cli[sub_idx + 1]
+        if !nxt.starts_with("--") { host = nxt }
+    }
+    let remote_cmd = _flag_value_pre(cli, "--command")
+    let c3 = _flag_value_pre(cli, "--c3")
+    op_exec(host, remote_cmd, c3)
     exit(0)
 }
 
