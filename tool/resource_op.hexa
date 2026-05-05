@@ -1286,6 +1286,7 @@ fn _kind_section(kind: string) -> string {
     if kind == "path-patch" { return "path-patches" }
     if kind == "env-export" { return "env-exports" }
     if kind == "npm-global" { return "npm-globals" }
+    if kind == "launchctl" { return "launchctl" }
     return ""
 }
 
@@ -1361,6 +1362,7 @@ fn _normalize_kind(token: string) -> string {
     if token == "path-patches" { return "path-patch" }
     if token == "env-exports" { return "env-export" }
     if token == "npm-globals" { return "npm-global" }
+    // launchctl is its own plural (no -s) — section header == slug
     return token
 }
 
