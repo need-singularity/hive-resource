@@ -1295,6 +1295,28 @@ fn _kind_id_field(kind: string) -> string {
     return "name"
 }
 
+// Per-kind list-typed field names. Keys named here whose CLI value contains
+// a comma (or is empty) are rendered as a yaml block list under the row,
+// matching the canonical format in spec/sync_registry.spec.yaml. Single
+// scalar values for these keys are still rendered as a one-element list so
+// the on-disk shape always matches the row schema's `list[string]` type
+// declared in hive/schemas/<kind>.spec.yaml.
+//
+// TODO: replace this hardcoded table with a schema lookup that reads
+// /Users/ghost/core/hive/schemas/<kind>.spec.yaml#fields[].type and matches
+// `list[*]`. The hardcoded form is the lighter-weight fix today; revisit
+// when a kind grows a second list-typed field or a new kind is added.
+//
+// Source of truth (2026-05-05):
+//   repo        → mirrors[]
+//   env-export  → lines[]
+//   hook, gate, deploy-key, path-patch, npm-global, kind → (none)
+fn _kind_list_keys(kind: string) -> string {
+    if kind == "repo" { return "mirrors" }
+    if kind == "env-export" { return "lines" }
+    return ""
+}
+
 // @io_seam: read the kinds[] manifest from sync_registry.spec.yaml. Returns
 // array of kind slug strings. Empty on parse failure (caller emits sentinel).
 //
@@ -1412,7 +1434,10 @@ fn _yaml_mutate(op: string, kind: string, name: string, kvs: array) -> array {
     let tmp_py = "/tmp/hive_resource_yaml_mut_" + pid + ".py"
     let py_src = _yaml_mutator_py_source()
     write_file(tmp_py, py_src)
-    let cmd = "python3 " + _shq(tmp_py) + " " + _shq(path) + " " + _shq(op) + " " + _shq(section) + " " + _shq(id_field) + " " + _shq(name) + " " + _shq(kv_blob) + " 2>&1"
+    // Pass per-kind list-typed field names so values from `--mirrors=a,b` are
+    // rendered as a yaml block list rather than a comma-glued scalar string.
+    let list_keys_blob = _kind_list_keys(kind)
+    let cmd = "python3 " + _shq(tmp_py) + " " + _shq(path) + " " + _shq(op) + " " + _shq(section) + " " + _shq(id_field) + " " + _shq(name) + " " + _shq(kv_blob) + " " + _shq(list_keys_blob) + " 2>&1"
     let out = to_string(exec(cmd))
     let _rm = exec("rm -f " + _shq(tmp_py) + " 2>/dev/null")
 
@@ -1456,6 +1481,8 @@ fn _yaml_mutator_py_source() -> string {
 "\n" +
 "def main():\n" +
 "    path, op, section, id_field, name, kv_blob = sys.argv[1:7]\n" +
+"    list_keys_blob = sys.argv[7] if len(sys.argv) > 7 else ''\n" +
+"    list_keys = set(s for s in list_keys_blob.split(',') if s)\n" +
 "    with open(path, 'r') as f:\n" +
 "        lines = f.read().split('\\n')\n" +
 "\n" +
@@ -1466,6 +1493,24 @@ fn _yaml_mutator_py_source() -> string {
 "            if '=' in tok:\n" +
 "                k, _, v = tok.partition('=')\n" +
 "                kvs.append((k, v))\n" +
+"\n" +
+"    # Render a single (k, v) pair as one or more yaml lines. List-typed\n" +
+"    # keys (per the kind's row schema) emit a block list under the key;\n" +
+"    # scalar keys emit `    k: v` unchanged so non-list round-trips stay\n" +
+"    # byte-identical. Empty list value → inline `[]`.\n" +
+"    def render_kv(k, v):\n" +
+"        if k in list_keys:\n" +
+"            if v == '':\n" +
+"                return ['    ' + k + ': []']\n" +
+"            elems = [e.strip() for e in v.split(',')]\n" +
+"            elems = [e for e in elems if e != '']\n" +
+"            if not elems:\n" +
+"                return ['    ' + k + ': []']\n" +
+"            out = ['    ' + k + ':']\n" +
+"            for e in elems:\n" +
+"                out.append('      - ' + e)\n" +
+"            return out\n" +
+"        return ['    ' + k + ': ' + v]\n" +
 "\n" +
 "    # Locate section header line (first occurrence of '^<section>:$').\n" +
 "    sect_hdr_idx = None\n" +
@@ -1484,7 +1529,7 @@ fn _yaml_mutator_py_source() -> string {
 "        lines.append(section + ':')\n" +
 "        body = ['  - ' + id_field + ': ' + name]\n" +
 "        for k, v in kvs:\n" +
-"            body.append('    ' + k + ': ' + v)\n" +
+"            body.extend(render_kv(k, v))\n" +
 "        lines.extend(body)\n" +
 "        with open(path, 'w') as f:\n" +
 "            f.write('\\n'.join(lines))\n" +
@@ -1563,7 +1608,7 @@ fn _yaml_mutator_py_source() -> string {
 "        # Build new row block.\n" +
 "        new_block = ['  - ' + id_field + ': ' + name]\n" +
 "        for k, v in kvs:\n" +
-"            new_block.append('    ' + k + ': ' + v)\n" +
+"            new_block.extend(render_kv(k, v))\n" +
 "        if target is not None:\n" +
 "            rs, re = target\n" +
 "            re_trim = trim_row_end(rs, re)\n" +
